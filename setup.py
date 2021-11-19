@@ -10,12 +10,12 @@ setup(
     author_email="c4ffein@gmail.com",
     packages=[],
     classifiers=["Development Status :: 1 - Planning",
-        "Intended Audience :: Developers"
-        "Intended Audience :: Education"
+        "Intended Audience :: Developers",
+        "Intended Audience :: Education",
         "Intended Audience :: Information Technology",
         "Intended Audience :: Other Audience",
         "Intended Audience :: Science/Research",
-        "Intended Audience :: System Administrators"
+        "Intended Audience :: System Administrators",
         "License :: OSI Approved :: MIT License",
         "Environment :: Console",
         "Operating System :: MacOS",
