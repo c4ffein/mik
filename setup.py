@@ -2,7 +2,7 @@ from setuptools import setup, find_packages
 
 setup(
     name="mik",
-    version="0.0.4.dev1",
+    version="0.0.4.dev2",
     description="KISS 1 command deploy",
     long_description="",
     url="https://github.com/c4ffein/mik",
@@ -10,7 +10,7 @@ setup(
     author_email="c4ffein@gmail.com",
     #packages=[],
     packages=find_packages(),
-    scripts=["mik"],
+    scripts=["scripts/mik"],
     classifiers=["Development Status :: 2 - Pre-Alpha",
         "Intended Audience :: Developers",
         "Intended Audience :: Education",
