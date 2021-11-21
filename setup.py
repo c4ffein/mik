@@ -2,13 +2,12 @@ from setuptools import setup, find_packages
 
 setup(
     name="mik",
-    version="0.0.4.dev4",
+    version="0.0.4",
     description="KISS 1 command deploy",
     long_description="",
     url="https://github.com/c4ffein/mik",
     author="c4ffein",
     author_email="c4ffein@gmail.com",
-    #packages=[],
     packages=find_packages(),
     scripts=["scripts/mik"],
     classifiers=["Development Status :: 2 - Pre-Alpha",
