@@ -74,6 +74,7 @@ def main(argv=None):
     args=parser.parse_args()
     base_url = os.getcwd()
 
+    if not args.command: parser.print_help(); return
     try:
         return {"deploy": deploy, "list": list, "autocomplete": autocomplete}[args.command](args)
     except MikException: return -1
