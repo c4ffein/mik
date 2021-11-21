@@ -2,7 +2,7 @@ from setuptools import setup, find_packages
 
 setup(
     name="mik",
-    version="0.0.4.dev2",
+    version="0.0.4.dev3",
     description="KISS 1 command deploy",
     long_description="",
     url="https://github.com/c4ffein/mik",
