@@ -1,14 +1,15 @@
-from setuptools import setup
+from setuptools import setup, find_packages
 
 setup(
     name="mik",
-    version="0.0.3",
+    version="0.0.4.dev1",
     description="KISS 1 command deploy",
     long_description="",
     url="https://github.com/c4ffein/mik",
     author="c4ffein",
     author_email="c4ffein@gmail.com",
-    packages=[],
+    #packages=[],
+    packages=find_packages(),
     scripts=["mik"],
     classifiers=["Development Status :: 2 - Pre-Alpha",
         "Intended Audience :: Developers",
