@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
 
-import os
 import sys
 import argparse
 import json
@@ -72,7 +71,6 @@ def main(argv=None):
     parser_autocomplete.add_argument("autocomplete", metavar="INSTANCE_NAME_START")
 
     args=parser.parse_args()
-    base_url = os.getcwd()
 
     if not args.command: parser.print_help(); return
     try:
