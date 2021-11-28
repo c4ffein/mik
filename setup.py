@@ -10,7 +10,8 @@ setup(
     author_email="c4ffein@gmail.com",
     packages=find_packages(),
     scripts=["scripts/mik"],
-    classifiers=["Development Status :: 2 - Pre-Alpha",
+    classifiers=[
+        "Development Status :: 2 - Pre-Alpha",
         "Intended Audience :: Developers",
         "Intended Audience :: Education",
         "Intended Audience :: Information Technology",
