@@ -67,13 +67,13 @@ def deploy(args):
 
 def main(argv=None):
 
-    parser = argparse.ArgumentParser(description=f"mik")
+    parser = argparse.ArgumentParser(description="mik")
     subparsers = parser.add_subparsers(help="sub-command help", dest="command")  # dest needed to identify subcommand
 
     parser_deploy = subparsers.add_parser("deploy", help="deploy help")
     parser_deploy.add_argument("instance", metavar="INSTANCE")
 
-    parser_list = subparsers.add_parser("list", help="list-instances help")
+    subparsers.add_parser("list", help="list-instances help")
 
     parser_autocomplete = subparsers.add_parser("autocomplete", help="autocomplete help")
     parser_autocomplete.add_argument("autocomplete", metavar="INSTANCE_NAME_START")
