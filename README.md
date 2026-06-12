@@ -12,31 +12,72 @@ KISS 1 command deploy
       <img src="https://img.shields.io/pypi/l/mik?color=blueviolet" /></a>
 </p>
 
-Just a PoC for now but still usable, just populate a json file in `~/.local/share/mik/instances.json` according to this pattern
+A tiny personal helper to deploy projects and pull dev changes back out of
+remote containers — driven by a single Python config file.
 
-```
-{
-  "instances": {
-    "instance1": {
-      "deploy": [
-        "cd ~/the/project/dir",
-        "make"
-      ]
-    },
-    "instance2": {
-      "deploy": [
-        "cd ~/the/project/dir2",
-        "make"
-      ]
+## ⚠️ Warning
+This is a proof-of-concept built around my own setup (docker, ssh). It works
+for me because I know exactly what it does — I don't recommend using it as-is.
+Read the source before pointing it at anything you care about.
+
+## Config
+
+mik loads `~/.config/mik/config.py`. It's a **Python** file (not JSON — older
+docs said otherwise): mik defines the base `Instance` and `Project` classes
+first, then runs your config, so you just subclass them. Defining a subclass
+registers it.
+
+```python
+# ~/.config/mik/config.py
+
+class MyServer(Instance):
+    name = "myserver"                # the name you pass on the command line
+    data = {
+        "ssh-host": "debian@vps-xxxx",   # ssh target, if your deploy/source scripts need it
+        "deploy": [                      # shell lines run locally for `mik deploy myserver`
+            "cd ~/code/myserver",
+            "make deploy",
+        ],
+        # "deploy_shell": "/bin/bash",          # optional, interpreter for the deploy lines
+        # "get-remote-source": ["..."],         # shell lines run for `mik get-remote-source`
     }
-  }
-}
+
+    # Instead of a "deploy" script you can define a method (called with no args):
+    # def deploy(): ...
+    # And per-part sub-deploys, reachable via `mik deploy myserver sub=web`:
+    # def deploy_web(): ...
+
+class MyProject(Project):
+    name = "myproject"
+    local_repo = "/home/me/code/myproject"   # where dev-fetch-pod writes fetched files
+    dev = {
+        "ssh-host": "debian@vps-xxxx",
+        "container": "myproject-web-1",      # docker container on the remote
+        "code_dir": "/app",                  # the git checkout inside that container
+    }
 ```
 
 ## Commands
-### `deploy`
-`mik deploy $instance` executes the according shell commands
-### `list`
-`mik list` lists all recorded instances in the config file
-### `autocomplete`
-`mik autocomplete $instance_name_begin` same as `list` but only the instances whith a name starting with `$instance_name_begin`
+
+```
+──────────────────────────── instances ────────────────────────────
+  mik list                          ==> list every instance in the config
+  mik autocomplete <prefix>         ==> like list, but only names starting with <prefix>
+  mik deploy <instance>             ==> run the instance's deploy() method or "deploy" script
+    + sub=<part>                    ==> run deploy_<part>() instead (errors if it doesn't exist)
+  mik get-remote-source <instance>  ==> run the instance's "get-remote-source" script
+
+──────────────────────────── projects ─────────────────────────────
+  mik dev-fetch-pod <project>       ==> pull changed files out of the project's remote
+                                        container (git status → confirm → fetch) into local_repo
+
+──────────────────────────── global ───────────────────────────────
+  --debug                           ==> print debug output to stderr (e.g. mik --debug deploy x)
+```
+
+### `dev-fetch-pod`
+Runs `git status` inside the remote container over ssh, shows you the changed /
+new / deleted files, and — only after you confirm — fetches their contents and
+applies them to `local_repo`. Paths are validated on both ends (no absolute
+paths, no `..`, no `.git/`, symlinks rejected) and the fetched set is checked
+against exactly what you confirmed before anything is written.
