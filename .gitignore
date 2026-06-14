@@ -32,6 +32,9 @@ var/
 .installed.cfg
 *.egg
 
+# uv / virtualenvs
+.venv/
+
 # Unit test / coverage reports
 htmlcov/
 .tox/
