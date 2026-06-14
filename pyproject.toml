@@ -1,2 +1,23 @@
-[tool.black]
+[project]
+name = "mik"
+version = "0.0.4"
+requires-python = ">=3.8"
+
+[tool.uv]
+# mik ships via setup.py (scripts/mik); uv is only used here to manage the dev env, not to build it.
+package = false
+
+[tool.ruff]
 line-length = 120
+target-version = "py38"
+
+[tool.ruff.format]
+# ruff format replaces black
+
+[tool.ruff.lint]
+# E/F (pyflakes + pycodestyle) on by default — close to the old flake8 behaviour.
+
+[dependency-groups]
+dev = [
+    "ruff>=0.6",
+]
