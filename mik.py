@@ -12,7 +12,7 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from enum import Enum
 from sys import exit
-from typing import Optional, TypedDict
+from typing import Optional
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 from uuid import uuid4
@@ -25,6 +25,7 @@ from uuid import uuid4
 # defined here is callable from your config. __all__ documents that config-facing surface and keeps these
 # helpers from reading as "unused" — they are public API for config authors, not dead code.
 __all__ = [
+    "Machine",
     "Instance",
     "Project",
     "MikException",
@@ -70,24 +71,53 @@ class MikException(Exception):
     pass
 
 
+machines_dict = {}
+
+
+class MachineMeta(type):
+    def __new__(mcs, name, bases, namespace):
+        if name == "Machine":
+            return super().__new__(mcs, name, bases, namespace)
+        if not namespace.get("name") or not namespace.get("ssh_host"):
+            raise MikException(f"Machine {name} needs a name and an ssh_host")
+        r = super().__new__(mcs, name, bases, namespace)
+        machines_dict[namespace["name"]] = r
+        return r
+
+
+class Machine(metaclass=MachineMeta):
+    """A real box you SSH into; hosts N instances (containers)."""
+
+    name: Optional[str] = None
+    ssh_host: Optional[str] = None  # "user@host"
+
+
 instances_dict = {}
 
 
 class InstanceMeta(type):
     def __new__(mcs, name, bases, namespace):
-        if name == "Instance":  # this is the base class, we can skip
+        if name == "Instance":  # the base class — skip registration
             return super().__new__(mcs, name, bases, namespace)
-        if not namespace.get("name") or not namespace.get("data"):
-            raise MikException(f"No name or data for {name}")
-        instances_dict[namespace["name"]] = namespace["data"]
+        if not namespace.get("name"):
+            raise MikException(f"Instance {name} needs a name")
         r = super().__new__(mcs, name, bases, namespace)
-        instances_dict[namespace["name"]]["object"] = r
+        instances_dict[namespace["name"]] = r
         return r
 
 
 class Instance(metaclass=InstanceMeta):
-    name = None
-    data = {}
+    """One project deployed on one machine, in one container."""
+
+    name: Optional[str] = None
+    project: Optional[str] = None  # -> Project name (N:1)
+    machine: Optional[str] = None  # -> Machine name (N:1)
+    container: Optional[str] = None  # docker container name
+    code_dir: Optional[str] = None  # path inside the container
+    deploy: Optional[list] = None  # shell commands (joined, run locally) — or override with a classmethod
+    deploy_shell: Optional[str] = None  # optional; defaults to /bin/bash
+    get_remote_source: Optional[list] = None  # optional legacy script
+    get_remote_source_shell: Optional[str] = None
 
 
 projects_dict = {}
@@ -104,15 +134,39 @@ class ProjectMeta(type):
         return r
 
 
-# ssh-host has a hyphen, so the functional TypedDict form is required (class syntax can't express it).
-DevConfig = TypedDict("DevConfig", {"container": str, "code_dir": str, "ssh-host": str})
-
-
 class Project(metaclass=ProjectMeta):
+    """The thing you develop (one repo); hosts N instances (its deployments)."""
+
     name: Optional[str] = None
     local_repo: Optional[str] = None
     github_repo: Optional[str] = None  # "owner/repo" — checked over the public GitHub API, no auth
-    dev: Optional[DevConfig] = None
+
+
+def _unique(seq):
+    seen = set()
+    out = []
+    for x in seq:
+        if x not in seen:
+            seen.add(x)
+            out.append(x)
+    return out
+
+
+# Relations are derived from the instance foreign keys — no join table, the instance IS the join.
+def instances_for_project(project_name):
+    return [name for name, i in instances_dict.items() if getattr(i, "project", None) == project_name]
+
+
+def instances_for_machine(machine_name):
+    return [name for name, i in instances_dict.items() if getattr(i, "machine", None) == machine_name]
+
+
+def projects_for_machine(machine_name):
+    return _unique(
+        getattr(i, "project", None)
+        for i in instances_dict.values()
+        if getattr(i, "machine", None) == machine_name and getattr(i, "project", None)
+    )
 
 
 def get_projects():
@@ -128,10 +182,117 @@ def get_instances():
     return instances
 
 
+def _print_relation_section(title, names, related_of):
+    """Print a bank-style section: each name with its related entities (or '(none)')."""
+    print(f"{title}\n{'─' * len(title)}")
+    for name in names:
+        related = related_of(name)
+        tail = ", ".join(related) if related else "(none)"
+        print(f"  {Color.PURP.value}{name.ljust(16)}{Color.WHITE.value}{Color.DIM.value} → {tail}{Color.WHITE.value}")
+
+
+def _warn_dangling_instances():
+    """An instance can name a project/machine that was never defined (a typo); surface those, muted."""
+    for name, i in instances_dict.items():
+        project = getattr(i, "project", None)
+        machine = getattr(i, "machine", None)
+        if project and project not in projects_dict:
+            print(
+                f"{Color.DIM.value}  warning: instance {name!r} references unknown project "
+                f"{project!r}{Color.WHITE.value}"
+            )
+        if machine and machine not in machines_dict:
+            print(
+                f"{Color.DIM.value}  warning: instance {name!r} references unknown machine "
+                f"{machine!r}{Color.WHITE.value}"
+            )
+
+
+def _print_instance_section(title, names):
+    """Each instance with its project and machine (its two foreign keys), bank-themed."""
+    print(f"{title}\n{'─' * len(title)}")
+    for name in names:
+        i = instances_dict.get(name)
+        project = getattr(i, "project", None) or "?"
+        machine = getattr(i, "machine", None) or "?"
+        print(
+            f"  {Color.PURP.value}{name.ljust(20)}{Color.WHITE.value}"
+            f"{Color.DIM.value} project={project}  machine={machine}{Color.WHITE.value}"
+        )
+
+
 def list_instances(args):
-    instances = get_instances()
-    for i in instances:
-        print(i)
+    """`list-instances`: bare instance names, or (with --show-links) each instance's project + machine.
+
+    `project=NAME` / `machine=NAME` filter to instances on that project / machine.
+    """
+    names = list(instances_dict)
+    project_filter = getattr(args, "project", None)
+    if project_filter:
+        if project_filter not in projects_dict:
+            raise MikException(f"{Color.RED.value}Project not found: {project_filter}{Color.WHITE.value}")
+        names = [n for n in names if n in set(instances_for_project(project_filter))]
+    machine_filter = getattr(args, "machine", None)
+    if machine_filter:
+        if machine_filter not in machines_dict:
+            raise MikException(f"{Color.RED.value}Machine not found: {machine_filter}{Color.WHITE.value}")
+        names = [n for n in names if n in set(instances_for_machine(machine_filter))]
+    if getattr(args, "show_links", False):
+        _print_instance_section("INSTANCES", names)
+    else:
+        for n in names:
+            print(n)
+
+
+def list_projects(args):
+    """`list-projects`: bare project names, or (with --show-instances) each project's instances.
+
+    `machine=NAME` filters to projects with an instance on that machine.
+    """
+    names = list(projects_dict)
+    machine_filter = getattr(args, "machine", None)
+    if machine_filter:
+        if machine_filter not in machines_dict:
+            raise MikException(f"{Color.RED.value}Machine not found: {machine_filter}{Color.WHITE.value}")
+        names = [n for n in names if n in set(projects_for_machine(machine_filter))]
+    if getattr(args, "show_instances", False):
+        _print_relation_section("PROJECTS", names, instances_for_project)
+    else:
+        for n in names:
+            print(n)
+
+
+def list_machines(args):
+    """`list-machines`: bare machine names, or (with --show-instances) each machine's instances.
+
+    `project=NAME` filters to machines running an instance of that project.
+    """
+    names = list(machines_dict)
+    project_filter = getattr(args, "project", None)
+    if project_filter:
+        if project_filter not in projects_dict:
+            raise MikException(f"{Color.RED.value}Project not found: {project_filter}{Color.WHITE.value}")
+        running = {
+            getattr(i, "machine", None)
+            for i in instances_dict.values()
+            if getattr(i, "project", None) == project_filter
+        }
+        names = [n for n in names if n in running]
+    if getattr(args, "show_instances", False):
+        _print_relation_section("MACHINES", names, instances_for_machine)
+    else:
+        for n in names:
+            print(n)
+
+
+def list_all(args):
+    """`list`: everything — machines, projects, and instances, each with their links."""
+    _print_relation_section("MACHINES", list(machines_dict), instances_for_machine)
+    print()
+    _print_relation_section("PROJECTS", list(projects_dict), instances_for_project)
+    print()
+    _print_instance_section("INSTANCES", list(instances_dict))
+    _warn_dangling_instances()
 
 
 def autocomplete(args):
@@ -142,44 +303,34 @@ def autocomplete(args):
 
 
 def deploy(args):
-    instances = get_instances()
     instance_name = args.instance
-    i = instances.get(instance_name)
-    if not i:
+    inst = instances_dict.get(instance_name)
+    if not inst:
         raise MikException(f"{Color.RED.value}Instance not found{Color.WHITE.value}")
-    obj = i["object"]
-    sub = getattr(args, "sub", None)
-    if sub:
-        # An explicitly requested sub-deploy must exist; never fall back silently.
-        method_name = f"deploy_{sub}"
-        deploy_method = getattr(obj, method_name, None)
-        if deploy_method is None:
-            raise MikException(f"{Color.RED.value}Instance has no {method_name} method{Color.WHITE.value}")
-        return deploy_method()
-    # No sub: prefer a deploy() method on the object, else fall back to the shell script.
-    deploy_method = getattr(obj, "deploy", None)
-    if deploy_method is not None:
-        return deploy_method()
-    d = i.get("deploy")
+    d = getattr(inst, "deploy", None)
+    if callable(d):
+        # Custom Python deploy (a classmethod on the Instance) — it runs and reports itself.
+        return d()
     if not d:
         raise MikException(f"{Color.RED.value}Instance has no deploy script{Color.WHITE.value}")
     s = "\n".join(d)
-    rc, _ = run_recorded("deploy", instance_name, s, i.get("deploy_shell") or "/bin/bash")
+    rc, _ = run_recorded("deploy", instance_name, s, getattr(inst, "deploy_shell", None) or "/bin/bash")
     if rc != 0:
         raise MikException(f"{Color.RED.value}deploy failed (rc={rc}){Color.WHITE.value}")
 
 
 def get_remote_source(args):
-    instances = get_instances()
     instance_name = args.instance
-    i = instances.get(instance_name)
-    if not i:
+    inst = instances_dict.get(instance_name)
+    if not inst:
         raise MikException(f"{Color.RED.value}Instance not found{Color.WHITE.value}")
-    d = i.get("get-remote-source")
+    d = getattr(inst, "get_remote_source", None)
     if not d:
-        raise MikException(f"{Color.RED.value}Instance has no get-remote-source script{Color.WHITE.value}")
+        raise MikException(f"{Color.RED.value}Instance has no get_remote_source script{Color.WHITE.value}")
     s = "\n".join(d)
-    rc, _ = run_recorded("get-remote-source", instance_name, s, i.get("get_remote_source_shell") or "/bin/bash")
+    rc, _ = run_recorded(
+        "get-remote-source", instance_name, s, getattr(inst, "get_remote_source_shell", None) or "/bin/bash"
+    )
     if rc != 0:
         raise MikException(f"{Color.RED.value}get-remote-source failed (rc={rc}){Color.WHITE.value}")
 
@@ -269,17 +420,19 @@ def pop(cmda):
     return proc.returncode, e, r
 
 
-def run_step(cmda, fail_on_stderr=True):
-    """Config helper: run an argv list via pop(), raising MikException on rc!=0 (or on any stderr).
+def run_step(cmda, fail_on_stderr=False):
+    """Config helper: run an argv list via pop(), raising MikException on rc!=0 (and optionally on stderr).
 
-    Note fail_on_stderr=True is strict — many tools write to stderr on success, so pass False for those.
+    Returns captured stdout. fail_on_stderr defaults to False because ssh/scp/git routinely write to
+    stderr on success; pass True for commands you expect to stay silent. The failing command is included
+    in the error, so config deploys stay locatable without a custom message per step.
     """
     c, e, r = pop(cmda)
     debug(f"step rc={c} cmd={cmda} err={e!r} out={r!r}")
     if c != 0:
-        raise MikException(f"step failed (rc={c}): {e.decode(errors='replace')}")
+        raise MikException(f"step failed (rc={c}): {' '.join(cmda)}\n{e.decode(errors='replace')}")
     if fail_on_stderr and e:
-        raise MikException(f"step succeeded (rc=0) but wrote to stderr: {e.decode(errors='replace')}")
+        raise MikException(f"step wrote to stderr: {' '.join(cmda)}\n{e.decode(errors='replace')}")
     return r
 
 
@@ -451,20 +604,21 @@ def _run_remote_script(ssh_host, container, script):
 
 
 def dev_fetch_pod(args):
-    projects = get_projects()
-    project = projects.get(args.project)
-    if not project:
-        raise MikException(f"{Color.RED.value}Project not found{Color.WHITE.value}")
-    if not project.dev:
-        raise MikException(f"{Color.RED.value}Project has no dev config{Color.WHITE.value}")
-    if not project.local_repo:
-        raise MikException(f"{Color.RED.value}Project has no local_repo{Color.WHITE.value}")
-    container = project.dev["container"]
-    code_dir = project.dev["code_dir"]
+    inst = instances_dict.get(args.instance)
+    if not inst:
+        raise MikException(f"{Color.RED.value}Instance not found{Color.WHITE.value}")
+    machine = machines_dict.get(getattr(inst, "machine", None))
+    if not machine or not machine.ssh_host:
+        raise MikException(f"{Color.RED.value}Instance has no machine with an ssh_host{Color.WHITE.value}")
+    project = projects_dict.get(getattr(inst, "project", None))
+    if not project or not project.local_repo:
+        raise MikException(f"{Color.RED.value}Instance's project has no local_repo{Color.WHITE.value}")
+    container = inst.container
+    code_dir = inst.code_dir
+    if not container or not code_dir:
+        raise MikException(f"{Color.RED.value}Instance has no container/code_dir{Color.WHITE.value}")
     local_repo = project.local_repo
-    ssh_host = project.dev.get("ssh-host")
-    if not ssh_host:
-        raise MikException(f"{Color.RED.value}Project dev has no ssh-host{Color.WHITE.value}")
+    ssh_host = machine.ssh_host
     for part in ssh_host.split("@"):
         validate_name(part)
     validate_name(container)
@@ -727,24 +881,48 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description="mik")
     parser.add_argument("--debug", action="store_true", help="enable debug output")
     subparsers = parser.add_subparsers(help="sub-command help", dest="command")  # dest needed to identify subcommand
-    # sub-command: list
-    subparsers.add_parser("list", help="list-instances help")
-    # sub-command: deploy
-    parser_deploy = subparsers.add_parser("deploy", help="deploy help")
-    parser_deploy.add_argument("instance", metavar="INSTANCE")
-    expected_params = {"sub": "Only deploy a specific part of the project"}
-    param_help = "Available parameters:\n"
-    for key, desc in expected_params.items():
-        param_help += f"  {key}=VALUE    {desc}\n"
-    parser_deploy.add_argument(
-        "params", nargs="*", action=get_key_value_action_with_limited_keys(list(expected_params)), help=param_help
+    # sub-command: list (everything)
+    subparsers.add_parser("list", help="list everything: instances and projects with their links")
+    # sub-command: list-machines
+    parser_list_machines = subparsers.add_parser("list-machines", help="list machines")
+    parser_list_machines.add_argument("--show-instances", action="store_true", help="show each machine's instances")
+    parser_list_machines.add_argument(
+        "params",
+        nargs="*",
+        action=get_key_value_action_with_limited_keys(["project"]),
+        help="project=NAME to filter machines running a project",
     )
-    # sub-command: get-remote-source
-    parser_deploy = subparsers.add_parser("get-remote-source", help="get-remote-source help")
+    # sub-command: list-instances
+    parser_list_instances = subparsers.add_parser("list-instances", help="list instances")
+    parser_list_instances.add_argument(
+        "--show-links", action="store_true", help="show each instance's project and machine"
+    )
+    parser_list_instances.add_argument(
+        "params",
+        nargs="*",
+        action=get_key_value_action_with_limited_keys(["project", "machine"]),
+        help="project=NAME and/or machine=NAME to filter instances",
+    )
+    # sub-command: list-projects
+    parser_list_projects = subparsers.add_parser("list-projects", help="list projects")
+    parser_list_projects.add_argument("--show-instances", action="store_true", help="show each project's instances")
+    parser_list_projects.add_argument(
+        "params",
+        nargs="*",
+        action=get_key_value_action_with_limited_keys(["machine"]),
+        help="machine=NAME to filter projects with an instance on a machine",
+    )
+    # sub-command: deploy
+    parser_deploy = subparsers.add_parser("deploy", help="deploy an instance")
     parser_deploy.add_argument("instance", metavar="INSTANCE")
+    # sub-command: get-remote-source
+    parser_get_remote_source = subparsers.add_parser("get-remote-source", help="run an instance's get_remote_source")
+    parser_get_remote_source.add_argument("instance", metavar="INSTANCE")
     # sub-command: dev-fetch-pod
-    parser_dev_fetch_pod = subparsers.add_parser("dev-fetch-pod", help="Fetch changed files from remote container")
-    parser_dev_fetch_pod.add_argument("project", metavar="PROJECT")
+    parser_dev_fetch_pod = subparsers.add_parser(
+        "dev-fetch-pod", help="Fetch changed files from an instance's container"
+    )
+    parser_dev_fetch_pod.add_argument("instance", metavar="INSTANCE")
     # sub-command: ci-status
     parser_ci_status = subparsers.add_parser("ci-status", help="Check default-branch pipeline status (or ALL)")
     parser_ci_status.add_argument("project", metavar="PROJECT_OR_ALL")
@@ -764,7 +942,10 @@ def main(argv=None):
         "deploy": deploy,
         "dev-fetch-pod": dev_fetch_pod,
         "ci-status": ci_status,
-        "list": list_instances,
+        "list": list_all,
+        "list-machines": list_machines,
+        "list-instances": list_instances,
+        "list-projects": list_projects,
         "autocomplete": autocomplete,
         "get-remote-source": get_remote_source,
     }[args.command](args)
