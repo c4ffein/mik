@@ -305,6 +305,57 @@ def fake_github(responses):
     return _inner
 
 
+class _FakeResp:
+    def __init__(self, body):
+        self._body = body
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+    def read(self):
+        return self._body
+
+
+class PinnedSslTests(unittest.TestCase):
+    PIN = "ab" * 32  # 64 hex chars; value is only checked during a real handshake
+
+    def test_context_is_pinned_and_verifying(self):
+        import ssl
+
+        ctx = mik.make_pinned_ssl_context(self.PIN)
+        self.assertIsInstance(ctx, ssl.SSLContext)
+        self.assertTrue(ctx.check_hostname)
+        self.assertEqual(ctx.verify_mode, ssl.CERT_REQUIRED)
+        self.assertEqual(type(ctx).__name__, "PinnedSSLContext")
+        self.assertEqual(ctx.sslsocket_class.__name__, "PinnedSSLSocket")
+
+    def test_get_uses_pinned_context_when_configured(self):
+        captured = {}
+
+        def fake_urlopen(req, timeout=None, context=None):
+            captured["context"] = context
+            return _FakeResp(b'{"ok": true}')
+
+        with mock.patch.object(mik, "GITHUB_CERT_SHA256", self.PIN), mock.patch.object(mik, "urlopen", fake_urlopen):
+            out = mik._github_get_json("/repos/o/r")
+        self.assertEqual(out, {"ok": True})
+        self.assertEqual(type(captured["context"]).__name__, "PinnedSSLContext")
+
+    def test_get_no_context_without_pin(self):
+        captured = {}
+
+        def fake_urlopen(req, timeout=None, context=None):
+            captured["context"] = context
+            return _FakeResp(b"{}")
+
+        with mock.patch.object(mik, "GITHUB_CERT_SHA256", None), mock.patch.object(mik, "urlopen", fake_urlopen):
+            mik._github_get_json("/repos/o/r")
+        self.assertIsNone(captured["context"])
+
+
 class RollupTests(unittest.TestCase):
     def test_states(self):
         self.assertEqual(mik._rollup_check_runs([]), mik.CI_NO_CHECKS)

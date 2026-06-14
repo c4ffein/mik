@@ -7,11 +7,25 @@ from pathlib import Path
 import subprocess
 import string
 import base64
+import os
 import traceback
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from enum import Enum
-from sys import exit
+from hashlib import sha256
+from ssl import (
+    CERT_NONE,
+    CERT_REQUIRED,
+    PROTOCOL_TLS_CLIENT,
+    PROTOCOL_TLS_SERVER,
+    Purpose,
+    SSLCertVerificationError,
+    SSLContext,
+    SSLSocket,
+    _ASN1Object,
+    _ssl,
+)
+from sys import exit, flags as sys_flags
 from typing import Optional
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
@@ -35,6 +49,7 @@ __all__ = [
     "run_step",
     "run_and_capture",
     "record_run",
+    "make_pinned_ssl_context",
     "sanr",
     "recursed",
 ]
@@ -709,6 +724,11 @@ def dev_fetch_pod(args):
 
 
 GITHUB_API = "https://api.github.com"
+# Optional certificate pinning for the GitHub API (paranoid mode). Set GITHUB_CERT_SHA256 in your config
+# to the sha256 of api.github.com's DER cert to pin it; GITHUB_CA_FILE optionally points at a CA bundle.
+# Left None, mik behaves exactly as before (urllib's default SSL context, no pinning).
+GITHUB_CERT_SHA256 = None
+GITHUB_CA_FILE = None
 
 # Pipeline rollup states (good < pending/no_checks are informational < failure/fetch_error are red)
 CI_GOOD = "good"
@@ -736,22 +756,72 @@ _CI_GLYPH = {
 _CI_RED_STATES = (CI_FAILURE, CI_FETCH_ERROR)
 
 
+def make_pinned_ssl_context(pinned_sha_256, cafile=None, capath=None, cadata=None):
+    """
+    Returns an instance of a subclass of SSLContext that uses a subclass of SSLSocket
+    that actually verifies the sha256 of the certificate during the TLS handshake
+    Tested with `python-version: [3.8, 3.9, 3.10, 3.11, 3.12, 3.13]`
+    Original code can be found at https://github.com/c4ffein/python-snippets
+    """
+
+    class PinnedSSLSocket(SSLSocket):
+        def check_pinned_cert(self):
+            der_cert_bin = self.getpeercert(True)
+            if sha256(der_cert_bin).hexdigest() != pinned_sha_256:
+                raise SSLCertVerificationError("Incorrect certificate checksum")
+
+        def do_handshake(self, *args, **kwargs):
+            r = super().do_handshake(*args, **kwargs)
+            self.check_pinned_cert()
+            return r
+
+    class PinnedSSLContext(SSLContext):
+        sslsocket_class = PinnedSSLSocket
+
+    def create_pinned_default_context(purpose=Purpose.SERVER_AUTH):
+        if not isinstance(purpose, _ASN1Object):
+            raise TypeError(purpose)
+        if purpose == Purpose.SERVER_AUTH:  # Verify certs and host name in client mode
+            context = PinnedSSLContext(PROTOCOL_TLS_CLIENT)
+            context.verify_mode, context.check_hostname = CERT_REQUIRED, True
+        elif purpose == Purpose.CLIENT_AUTH:
+            context = PinnedSSLContext(PROTOCOL_TLS_SERVER)
+        else:
+            raise ValueError(purpose)
+        context.verify_flags |= _ssl.VERIFY_X509_STRICT
+        if cafile or capath or cadata:
+            context.load_verify_locations(cafile, capath, cadata)
+        elif context.verify_mode != CERT_NONE:
+            context.load_default_certs(purpose)  # Try loading default system root CA certificates, may fail silently
+        if hasattr(context, "keylog_filename"):  # OpenSSL 1.1.1 keylog file
+            keylogfile = os.environ.get("SSLKEYLOGFILE")
+            if keylogfile and not sys_flags.ignore_environment:
+                context.keylog_filename = keylogfile
+        return context
+
+    return create_pinned_default_context()
+
+
 def _github_get_json(path):
     """Unauthenticated GET against the public GitHub REST API; returns parsed JSON.
 
     Raises MikException on any transport/HTTP error so callers can bucket the failure. A User-Agent is
-    required by GitHub or it answers 403.
+    required by GitHub or it answers 403. If GITHUB_CERT_SHA256 is set (in config), api.github.com's
+    certificate is pinned; GITHUB_CA_FILE optionally supplies the CA bundle.
     """
     req = Request(
         f"{GITHUB_API}{path}",
         headers={"Accept": "application/vnd.github+json", "User-Agent": "mik"},
     )
+    context = make_pinned_ssl_context(GITHUB_CERT_SHA256, cafile=GITHUB_CA_FILE) if GITHUB_CERT_SHA256 else None
     try:
-        with urlopen(req, timeout=10) as resp:
+        with urlopen(req, timeout=10, context=context) as resp:
             return json.loads(resp.read().decode())
     except HTTPError as exc:
         raise MikException(f"{exc.code} {exc.reason}") from exc
     except URLError as exc:
+        if isinstance(exc.reason, SSLCertVerificationError):
+            raise MikException(f"cert pin/verify failed: {exc.reason}") from exc
         raise MikException(f"network error: {exc.reason}") from exc
 
 
