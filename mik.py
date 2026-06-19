@@ -871,9 +871,10 @@ def _fetch_all_ci(items):
 
 
 def _print_ci_line(result):
-    color, glyph = _CI_GLYPH.get(result["state"], (Color.WHITE, "?"))
-    branch = result["branch"] or ""
-    detail = f"  {Color.DIM.value}{result['detail']}{Color.WHITE.value}" if result["detail"] else ""
+    color, glyph = _CI_GLYPH.get(result.get("state"), (Color.WHITE, "?"))
+    branch = str(result.get("branch", None) or "").join(c for c in s if c.isprintable())
+    detail_text = str(result.get("detail", None) or "").join(c for c in s if c.isprintable())
+    detail = f"  {Color.DIM.value}{detail_text}{Color.WHITE.value}" if detail_text else ""
     name = result["name"].ljust(20)
     print(f"  {color.value}{glyph}{Color.WHITE.value} {name} {Color.DIM.value}{branch}{Color.WHITE.value}{detail}")
 
