@@ -57,6 +57,7 @@ __all__ = [
     "artifact_category_dir",
     "build_artifact",
     "latest_release",
+    "resolve_release",
     "prune_artifacts",
 ]
 
@@ -331,13 +332,30 @@ def deploy(args):
     d = getattr(inst, "deploy", None)
     if callable(d):
         # Custom Python deploy (a classmethod on the Instance) — it runs and reports itself.
-        return d()
+        # An optional RELEASE_ID forwards through for instances whose deploy ships a chosen artifact.
+        release_id = getattr(args, "release_id", None)
+        return d(release_id) if release_id is not None else d()
+    release_id = getattr(args, "release_id", None)
+    if release_id is not None:
+        raise MikException(f"{Color.RED.value}{instance_name} has a script deploy; RELEASE_ID not supported{Color.WHITE.value}")
     if not d:
         raise MikException(f"{Color.RED.value}Instance has no deploy script{Color.WHITE.value}")
     s = "\n".join(d)
     rc, _ = run_recorded("deploy", instance_name, s, getattr(inst, "deploy_shell", None) or "/bin/bash")
     if rc != 0:
         raise MikException(f"{Color.RED.value}deploy failed (rc={rc}){Color.WHITE.value}")
+
+
+def build(args):
+    """`build INSTANCE`: run an instance's build step, producing a local artifact (no remote side effects)."""
+    instance_name = args.instance
+    inst = instances_dict.get(instance_name)
+    if not inst:
+        raise MikException(f"{Color.RED.value}Instance not found{Color.WHITE.value}")
+    b = getattr(inst, "build", None)
+    if not callable(b):
+        raise MikException(f"{Color.RED.value}Instance has no build step{Color.WHITE.value}")
+    return b()
 
 
 def get_remote_source(args):
@@ -494,6 +512,18 @@ def latest_release(category):
     if not entries:
         raise MikException(f"no artifacts in {artifact_category_dir(category)}")
     return entries[-1][1]
+
+
+def resolve_release(category, release_id):
+    """Config helper: the artifact in `category` matching `release_id` (full entry name OR bare epoch prefix).
+
+    So `resolve_release("presentations-dist", "1750000000")` and `"1750000000-dist"` both find the same
+    entry — handy for rollback from the CLI, where you'd rather type the epoch than the full dir name.
+    """
+    for epoch, p in _artifact_entries(category):
+        if p.name == release_id or str(epoch) == release_id:
+            return p
+    raise MikException(f"no artifact in {artifact_category_dir(category)} matching {release_id!r}")
 
 
 def prune_artifacts(category, keep=10):
@@ -1085,6 +1115,16 @@ def main(argv=None):
     # sub-command: deploy
     parser_deploy = subparsers.add_parser("deploy", help="deploy an instance")
     parser_deploy.add_argument("instance", metavar="INSTANCE")
+    parser_deploy.add_argument(
+        "release_id",
+        metavar="RELEASE_ID",
+        nargs="?",
+        default=None,
+        help="optional: ship/roll back to a specific local artifact (epoch or full name); Python deploys only",
+    )
+    # sub-command: build
+    parser_build = subparsers.add_parser("build", help="build an instance's local artifact")
+    parser_build.add_argument("instance", metavar="INSTANCE")
     # sub-command: get-remote-source
     parser_get_remote_source = subparsers.add_parser("get-remote-source", help="run an instance's get_remote_source")
     parser_get_remote_source.add_argument("instance", metavar="INSTANCE")
@@ -1110,6 +1150,7 @@ def main(argv=None):
     load_config()
     return {
         "deploy": deploy,
+        "build": build,
         "dev-fetch-pod": dev_fetch_pod,
         "ci-status": ci_status,
         "list": list_all,
