@@ -5,6 +5,7 @@ import argparse
 import json
 from pathlib import Path
 import subprocess
+import shutil
 import string
 import base64
 import os
@@ -52,6 +53,11 @@ __all__ = [
     "make_pinned_ssl_context",
     "sanr",
     "recursed",
+    "ARTIFACTS_DIR",
+    "artifact_category_dir",
+    "build_artifact",
+    "latest_release",
+    "prune_artifacts",
 ]
 
 
@@ -408,6 +414,99 @@ def run_recorded(command, target, script, executable):
     rc, output = run_and_capture(script, executable)
     record_run(command, target, started, datetime.now().astimezone(), rc, output)
     return rc, output
+
+
+# ## Local artifact store #############################################################################
+# Layout: ~/artifacts/<category>/<epoch>-<suffix>. One immutable entry per build; "newest" is the largest
+# integer epoch prefix. An entry may be a directory (a static tree) OR a single file (e.g. a .tar image).
+# A build stages into a hidden sibling *inside the category dir* (same filesystem) and atomically
+# renames into place: a partial build is never visible to latest_release()/prune_artifacts() (they skip
+# dotfiles) and is never half-shipped. A crash leaves only a `.mik-build-*` dotfile, which selectors ignore.
+ARTIFACTS_DIR = Path.home() / "artifacts"
+
+
+def artifact_category_dir(category):
+    """Config helper: the directory holding every release of one artifact category."""
+    return ARTIFACTS_DIR / category
+
+
+def _remove_path(p):
+    """rmtree a real directory, unlink anything else (file or symlink). No-op if absent."""
+    if p.is_dir() and not p.is_symlink():
+        shutil.rmtree(p)
+    elif p.is_symlink() or p.exists():
+        p.unlink()
+
+
+def build_artifact(category, suffix, build, release_id=None):
+    """Config helper: build one immutable artifact and return its path.
+
+    `release_id` (epoch seconds) is minted here unless you pass one, so the id is fixed at *build* time
+    and travels with the entry. `build(staging)` receives a not-yet-existing path under the category dir
+    and must create it as a file or a directory; on success it is atomically renamed to
+    <release_id>-<suffix>, on any error it is removed so no partial entry litters the store.
+    """
+    rid = str(release_id if release_id is not None else int(datetime.now().timestamp()))
+    if not rid.isdigit():
+        raise MikException(f"bad release_id (want epoch digits): {rid!r}")
+    if not all(c.isalnum() or c in ".-_" for c in category):
+        raise MikException(f"invalid category when building artifact: {suffix}")
+    if not all(c.isalnum() or c in ".-_" for c in suffix):
+        raise MikException(f"invalid suffix when building artifact: {suffix}")
+    base = artifact_category_dir(category)
+    base.mkdir(parents=True, exist_ok=True)
+    final = base / f"{rid}-{suffix}"
+    if final.exists():
+        raise MikException(f"artifact already exists: {final}")
+    staging = base / f".mik-build-{rid}-{suffix}"  # hidden + same dir => atomic rename, ignored by selectors
+    _remove_path(staging)  # clear a previous half-done attempt
+    try:
+        build(staging)
+        if not staging.exists():
+            raise MikException(f"build() produced nothing at {staging}")
+        staging.rename(final)  # atomic: same directory, same filesystem
+    except BaseException:
+        _remove_path(staging)
+        raise
+    debug(f"built artifact {final}")
+    return final
+
+
+def _artifact_entries(category):
+    """(epoch:int, path) for every well-formed entry in a category, oldest-first. Dotfiles skipped.
+
+    Restricting names to [A-Za-z0-9-._] keeps each entry's name safe to interpolate into a remote shell.
+    """
+    base = artifact_category_dir(category)
+    entries = []
+    for p in base.iterdir():
+        if p.name.startswith("."):  # .mik-build-* staging and other hidden cruft
+            continue
+        head = p.name.split("-", 1)[0]
+        if head.isdigit() and all(c.isalnum() or c in "-._" for c in p.name):
+            entries.append((int(head), p))
+    return sorted(entries, key=lambda t: t[0])
+
+
+def latest_release(category):
+    """Config helper: newest artifact (file or dir) in a category, ordered by integer epoch prefix."""
+    entries = _artifact_entries(category)
+    if not entries:
+        raise MikException(f"no artifacts in {artifact_category_dir(category)}")
+    return entries[-1][1]
+
+
+def prune_artifacts(category, keep=10):
+    """Config helper: delete all but the newest `keep` artifacts (file or dir). Returns removed paths."""
+    if keep < 0:
+        raise MikException("keep must be >= 0")
+    entries = _artifact_entries(category)
+    removed = []
+    for _, p in (entries[:-keep] if keep else entries):
+        _remove_path(p)
+        debug(f"pruned local artifact {p}")
+        removed.append(p)
+    return removed
 
 
 def recursed(func, args, instances):
