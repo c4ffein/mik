@@ -5,8 +5,11 @@ Tested at the CLI/effect boundary (args in -> subprocess / HTTP / file effects o
 internals, mocking the subprocess / SSH / HTTP layers. Stdlib only; run with `make test` or `python test.py`.
 """
 
+import io
 import json
+import os
 import re
+import tarfile
 import tempfile
 import unittest
 from pathlib import Path
@@ -42,6 +45,90 @@ class ValidatePathTests(unittest.TestCase):
     def test_rejects_weird_chars(self):
         for p in ("a b.txt", "a;rm.txt", "a$b", "a\tb"):
             self.assertFalse(mik.validate_path(p), p)
+
+
+def _tar_with(*members):
+    """A .tar.gz BytesIO from (TarInfo, payload-or-None) pairs — payload only for regular files."""
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:gz") as t:
+        for ti, data in members:
+            t.addfile(ti, io.BytesIO(data) if data is not None else None)
+    buf.seek(0)
+    return buf
+
+
+def _reg(name, data=b"x"):
+    ti = tarfile.TarInfo(name)
+    ti.type, ti.size = tarfile.REGTYPE, len(data)
+    return (ti, data)
+
+
+def _link(name, target, kind):
+    ti = tarfile.TarInfo(name)
+    ti.type, ti.linkname = kind, target  # kind: tarfile.SYMTYPE (symlink) or tarfile.LNKTYPE (hardlink)
+    return (ti, None)
+
+
+def _dev(name):
+    ti = tarfile.TarInfo(name)
+    ti.type, ti.devmajor, ti.devminor = tarfile.CHRTYPE, 1, 3
+    return (ti, None)
+
+
+class SafeTarMemberTests(unittest.TestCase):
+    """Covers every row of the threat table for the safe_tar_member extraction filter.
+
+    extract() runs a built archive through safe_tar_member into a throwaway dir; it returns the set of
+    paths (relative to dest) that landed, and asserts nothing escaped the dest along the way.
+    """
+
+    def extract(self, *members):
+        with tempfile.TemporaryDirectory() as d:
+            with tarfile.open(fileobj=_tar_with(*members), mode="r:gz") as t:
+                t.extractall(d, filter=mik.safe_tar_member)
+            landed = sorted(os.path.relpath(os.path.join(root, f), d) for root, _, files in os.walk(d) for f in files)
+            # nothing must have been written outside the destination tree
+            for rel in landed:
+                self.assertFalse(rel.startswith(".."), f"escaped dest: {rel}")
+            return landed
+
+    def test_plain_regular_file_extracts(self):
+        self.assertEqual(self.extract(_reg("index.html")), ["index.html"])
+
+    def test_absolute_name_is_de_rooted_into_dest(self):
+        # data_filter strips the leading '/', so it lands *inside* dest rather than at /etc/passwd
+        self.assertEqual(self.extract(_reg("/etc/passwd")), ["etc/passwd"])
+
+    def test_escaping_dotdot_names_are_refused(self):
+        # leading and *embedded* .. that resolve outside dest — data_filter judges by resolved target
+        for name in ("../../escape", "a/../../b", "a/b/../../../c"):
+            with self.assertRaises(mik.MikException, msg=name):
+                self.extract(_reg(name))
+
+    def test_normalized_but_safe_dotdot_lands_inside(self):
+        # a/../b resolves to b *inside* dest, so it's allowed — only paths that actually escape are rejected
+        self.assertEqual(self.extract(_reg("a/../b")), ["b"])
+
+    def test_absolute_symlink_is_refused(self):
+        with self.assertRaises(mik.MikException):
+            self.extract(_link("evil", "/etc/passwd", tarfile.SYMTYPE))
+
+    def test_escaping_symlink_is_refused(self):
+        with self.assertRaises(mik.MikException):
+            self.extract(_link("evil", "../../etc/passwd", tarfile.SYMTYPE))
+
+    def test_device_special_file_is_refused(self):
+        with self.assertRaises(mik.MikException):
+            self.extract(_dev("nul"))
+
+    def test_internal_symlink_is_refused(self):
+        # data_filter would allow this (it's inside dest); safe_tar_member's added strictness rejects it
+        with self.assertRaises(mik.MikException):
+            self.extract(_reg("index.html"), _link("a", "index.html", tarfile.SYMTYPE))
+
+    def test_internal_hardlink_is_refused(self):
+        with self.assertRaises(mik.MikException):
+            self.extract(_reg("index.html"), _link("a", "index.html", tarfile.LNKTYPE))
 
 
 class ValidateNameTests(unittest.TestCase):
@@ -615,6 +702,20 @@ class DeployReleaseTests(unittest.TestCase):
                     mik.deploy_release(**{**base, **override})
                 pop.assert_not_called()  # validation precedes even the preflight
                 rs.assert_not_called()
+
+    def test_symlink_in_artifact_refused_before_any_remote_call(self):
+        # defense-in-depth: scp -r / cp -rL would dereference a stray link into the web root, so refuse first
+        with tempfile.TemporaryDirectory() as d:
+            src = self._src(d)
+            (src / "sneaky").symlink_to("/etc/passwd")
+            with mock.patch.object(mik, "pop") as pop, mock.patch.object(mik, "run_step") as rs, mock.patch.object(
+                mik, "sleep"
+            ):
+                with self.assertRaises(mik.MikException) as cm:
+                    mik.deploy_release(src, "user@host", "/var/www/site", release_id="123", name="site")
+            self.assertIn("symlink in artifact", str(cm.exception))
+            pop.assert_not_called()  # payload check precedes even the writability preflight
+            rs.assert_not_called()
 
     def test_prune_failure_does_not_fail_deploy(self):
         with tempfile.TemporaryDirectory() as d:

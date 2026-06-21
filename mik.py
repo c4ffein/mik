@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 import subprocess
 import shutil
+import tarfile
 import string
 import base64
 import os
@@ -60,6 +61,7 @@ __all__ = [
     "latest_release",
     "resolve_release",
     "prune_artifacts",
+    "safe_tar_member",
 ]
 
 
@@ -543,6 +545,46 @@ def prune_artifacts(category, keep=10):
     return removed
 
 
+def safe_tar_member(member, path):
+    """Config helper: a tarfile extraction filter = the stdlib 'data' filter, then a flat refusal of links.
+
+    Pass as `tar.extractall(dest, filter=safe_tar_member)`. data_filter already neutralises every escape:
+    absolute member names are de-rooted into dest, names or link targets that would resolve outside dest
+    raise (OutsideDestinationError / AbsoluteLinkError / LinkOutsideDestinationError), and device/FIFO
+    specials raise (SpecialFileError). This only *adds* strictness on top — a built static artifact has no
+    business carrying links, so every symlink/hardlink is rejected, including dest-internal ones data_filter
+    would otherwise allow. Strictly stronger than filter="data": anything data_filter rejects, this rejects
+    identically. Raising aborts extractall (the exception propagates), so a hostile or malformed archive
+    fails the build loudly instead of extracting partially.
+    """
+    try:
+        member = tarfile.data_filter(member, path)  # de-roots leading '/', raises on escape / special file
+    except tarfile.FilterError as exc:  # surface as MikException so it prints clean + exits 1, not a traceback
+        raise MikException(f"refusing archive member {member.name!r}: {exc}") from exc
+    if member.issym() or member.islnk():
+        raise MikException(f"refusing link in archive: {member.name!r} -> {member.linkname!r}")
+    return member
+
+
+def _assert_artifact_has_no_links(src):
+    """Refuse, before any remote contact, if the artifact tree holds a symlink or a non-regular file.
+
+    Defense-in-depth at the deploy chokepoint, independent of how the artifact was built: deploy can ship
+    one produced by older code or a different build path (tar extract, copytree, ...), and `scp -r` / the
+    overlap `cp -rL` both dereference symlinks — a stray link would copy its target straight into the public
+    web root. Only regular files and directories may ship. os.walk(followlinks=False) lists a symlinked dir
+    but never descends into it, so links are reported, never followed; islink is checked before is_file/
+    is_dir (which would follow the link) so the link itself is what we catch.
+    """
+    for root, dirs, files in os.walk(str(src), followlinks=False):
+        for name in dirs + files:
+            p = os.path.join(root, name)
+            if os.path.islink(p):
+                raise MikException(f"refusing to deploy: symlink in artifact: {p}")
+            if not (os.path.isfile(p) or os.path.isdir(p)):
+                raise MikException(f"refusing to deploy: non-regular file in artifact: {p}")
+
+
 def pop(cmda):
     """Config helper: run an argv list, capturing stdout/stderr separately.
 
@@ -709,6 +751,7 @@ def deploy_release(src, ssh_host, site_root, release_id, name, keep=5, overlap_s
             validate_name(part)
         except Exception as exc:
             raise MikException(f"unsafe ssh_host: {ssh_host!r}") from exc
+    _assert_artifact_has_no_links(src)  # payload check, before any remote contact: scp -r/cp -rL deref links
     # Invariant from here on: rid is alnum and site_root is a clean absolute path, so every remote string
     # composed below ({site_root}/releases/{rid}, .mik-STAGING-{rid}, .mik-OVERLAP-{rid}, ...) is shell-safe
     # by construction. That's why the sinks below — including _flip_current — interpolate without re-checking.
