@@ -55,6 +55,17 @@ class ValidateNameTests(unittest.TestCase):
                 mik.validate_name(n)
 
 
+class ValidateCodeDirTests(unittest.TestCase):
+    def test_accepts(self):
+        for p in ("/code", "/home/dev/workspace/mik", "/a-b/c_d.e", "/x/y/z"):
+            mik.validate_code_dir(p)  # must not raise
+
+    def test_rejects(self):
+        for p in ("", "code", "rel/path", "/a/../b", "/a b/c", "/a;b", "/a$b", "/a|b"):
+            with self.assertRaises(mik.MikException):
+                mik.validate_code_dir(p)
+
+
 class AutocompleteTests(unittest.TestCase):
     def setUp(self):
         mik.instances_dict.clear()
@@ -339,7 +350,9 @@ class PinnedSslTests(unittest.TestCase):
             captured["context"] = context
             return _FakeResp(b'{"ok": true}')
 
-        with mock.patch.object(mik, "GITHUB_CERT_SHA256", self.PIN), mock.patch.object(mik, "urlopen", fake_urlopen):
+        with mock.patch.object(mik, "GITHUB_COM_CERT_SHA256", self.PIN), mock.patch.object(
+            mik, "urlopen", fake_urlopen
+        ):
             out = mik._github_get_json("/repos/o/r")
         self.assertEqual(out, {"ok": True})
         self.assertEqual(type(captured["context"]).__name__, "PinnedSSLContext")
@@ -351,8 +364,36 @@ class PinnedSslTests(unittest.TestCase):
             captured["context"] = context
             return _FakeResp(b"{}")
 
-        with mock.patch.object(mik, "GITHUB_CERT_SHA256", None), mock.patch.object(mik, "urlopen", fake_urlopen):
+        with mock.patch.object(mik, "GITHUB_COM_CERT_SHA256", None), mock.patch.object(mik, "urlopen", fake_urlopen):
             mik._github_get_json("/repos/o/r")
+        self.assertIsNone(captured["context"])
+
+
+class PinnedUrlopenTests(unittest.TestCase):
+    PIN = "ab" * 32  # 64 hex chars; only verified during a real handshake
+
+    def test_pins_when_sha_given(self):
+        captured = {}
+
+        def fake_urlopen(url, timeout=None, context=None):
+            captured["context"] = context
+            return _FakeResp(b"x")
+
+        with mock.patch.object(mik, "urlopen", fake_urlopen):
+            with mik.pinned_urlopen("https://x/y", self.PIN) as r:
+                self.assertEqual(r.read(), b"x")
+        self.assertEqual(type(captured["context"]).__name__, "PinnedSSLContext")
+
+    def test_no_pin_means_no_context(self):
+        captured = {}
+
+        def fake_urlopen(url, timeout=None, context=None):
+            captured["context"] = context
+            return _FakeResp(b"x")
+
+        with mock.patch.object(mik, "urlopen", fake_urlopen):
+            with mik.pinned_urlopen("https://x/y"):
+                pass
         self.assertIsNone(captured["context"])
 
 
@@ -407,13 +448,13 @@ class CiStatusTests(unittest.TestCase):
             }
         )
         with mock.patch.object(mik, "_github_get_json", side_effect=fake):
-            self.assertEqual(mik.ci_status(SimpleNamespace(project="p")), -1)
+            self.assertEqual(mik.ci_status(SimpleNamespace(project="p")), 1)
 
     def test_fetch_error_is_nonzero(self):
         self._proj("p", "o/r")
         fake = fake_github({"/repos/o/r": mik.MikException("404 Not Found")})
         with mock.patch.object(mik, "_github_get_json", side_effect=fake):
-            self.assertEqual(mik.ci_status(SimpleNamespace(project="p")), -1)
+            self.assertEqual(mik.ci_status(SimpleNamespace(project="p")), 1)
 
     def test_missing_github_repo_raises(self):
         self._proj("p", None)
@@ -439,7 +480,7 @@ class CiStatusTests(unittest.TestCase):
         with mock.patch.object(mik, "_github_get_json", side_effect=fake):
             with mock.patch("builtins.print"):  # silence the grouped output during the test
                 rc = mik.ci_status(SimpleNamespace(project="ALL"))
-        self.assertEqual(rc, -1)  # bad1 is a failure
+        self.assertEqual(rc, 1)  # bad1 is a failure
 
     def test_all_with_no_github_projects(self):
         self._proj("noci", None)

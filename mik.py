@@ -51,8 +51,7 @@ __all__ = [
     "run_and_capture",
     "record_run",
     "make_pinned_ssl_context",
-    "sanr",
-    "recursed",
+    "pinned_urlopen",
     "ARTIFACTS_DIR",
     "artifact_category_dir",
     "build_artifact",
@@ -337,7 +336,9 @@ def deploy(args):
         return d(release_id) if release_id is not None else d()
     release_id = getattr(args, "release_id", None)
     if release_id is not None:
-        raise MikException(f"{Color.RED.value}{instance_name} has a script deploy; RELEASE_ID not supported{Color.WHITE.value}")
+        raise MikException(
+            f"{Color.RED.value}{instance_name} has a script deploy; RELEASE_ID not supported{Color.WHITE.value}"
+        )
     if not d:
         raise MikException(f"{Color.RED.value}Instance has no deploy script{Color.WHITE.value}")
     s = "\n".join(d)
@@ -532,26 +533,11 @@ def prune_artifacts(category, keep=10):
         raise MikException("keep must be >= 0")
     entries = _artifact_entries(category)
     removed = []
-    for _, p in (entries[:-keep] if keep else entries):
+    for _, p in entries[:-keep] if keep else entries:
         _remove_path(p)
         debug(f"pruned local artifact {p}")
         removed.append(p)
     return removed
-
-
-def recursed(func, args, instances):
-    """Config helper: run `func` over every instance, collecting results (or the raised Exception)."""
-    ret = {}
-    for instance_name in instances:
-
-        class A:
-            instance = instance_name
-
-        try:
-            ret[instance_name] = func(A)
-        except Exception as e:
-            ret[instance_name] = e
-    return ret
 
 
 def pop(cmda):
@@ -578,15 +564,6 @@ def run_step(cmda, fail_on_stderr=False):
     if fail_on_stderr and e:
         raise MikException(f"step wrote to stderr: {' '.join(cmda)}\n{e.decode(errors='replace')}")
     return r
-
-
-def sanr(bs):
-    """Config helper: assert `bs[:-1]` is ASCII alphanumeric and decode it (sanitises an ssh'd username)."""
-    sshed_user = bs[:-1]
-    for i in sshed_user:
-        if i not in (map(lambda c: ord(c), string.ascii_letters + string.digits)):
-            raise Exception("Bad san")
-    return str(sshed_user, "utf-8")  # or fstrings will fail...
 
 
 _valid_name_ords = (
@@ -642,6 +619,25 @@ def validate_path(p):
             if ord(c) not in _valid_path_ords:
                 return False
     return True
+
+
+_valid_code_dir_ords = (*_valid_path_ords, ord("/"))
+
+
+def validate_code_dir(s):
+    """Validate an absolute container path (e.g. /home/dev/workspace/x): allow [A-Za-z0-9.-_/] only.
+
+    We own this value (it comes from our own config), so this is belt-and-suspenders — but a clean
+    allowlist costs nothing and keeps code_dir boring before it reaches the remote git/python. Raises.
+    """
+    if not s or not s.startswith("/"):
+        raise MikException(f"bad code_dir (want an absolute path): {s!r}")
+    for comp in s.split("/"):
+        if comp == "..":
+            raise MikException(f"'..' not allowed in code_dir: {s!r}")
+    for c in s:
+        if ord(c) not in _valid_code_dir_ords:
+            raise MikException(f"bad char {c!r} in code_dir: {s!r}")
 
 
 # This is the validation logic inlined as a string for remote scripts (no re, no imports beyond builtins)
@@ -766,6 +762,7 @@ def dev_fetch_pod(args):
     for part in ssh_host.split("@"):
         validate_name(part)
     validate_name(container)
+    validate_code_dir(code_dir)
     # Pass 1: list changed files
     script = REMOTE_SCRIPT_LIST.format(
         validate_path=_REMOTE_VALIDATE_PATH,
@@ -853,11 +850,14 @@ def dev_fetch_pod(args):
 
 
 GITHUB_API = "https://api.github.com"
-# Optional certificate pinning for the GitHub API (paranoid mode). Set GITHUB_CERT_SHA256 in your config
-# to the sha256 of api.github.com's DER cert to pin it; GITHUB_CA_FILE optionally points at a CA bundle.
-# Left None, mik behaves exactly as before (urllib's default SSL context, no pinning).
-GITHUB_CERT_SHA256 = None
-GITHUB_CA_FILE = None
+# Optional certificate pinning (paranoid mode). Set any of these in your config to pin the sha256 of that
+# host's DER *leaf* cert; ROOT_CA_FILE optionally points at the CA bundle used to verify. Left None, mik
+# behaves exactly as before (urllib's default SSL context, no pinning).
+# NOTE: a leaf pin breaks the moment the host rotates its cert (GitHub / Let's Encrypt do, regularly) — a
+# previously green deploy then fails with "cert pin/verify failed" until you refresh the sha below.
+ROOT_CA_FILE = None
+GITHUB_COM_CERT_SHA256 = None  # api.github.com (used by ci-status)
+GITHUB_IO_CERT_SHA256 = None  # *.github.io, e.g. c4ffein.github.io release archives (used by config builds)
 
 # Pipeline rollup states (good < pending/no_checks are informational < failure/fetch_error are red)
 CI_GOOD = "good"
@@ -931,18 +931,28 @@ def make_pinned_ssl_context(pinned_sha_256, cafile=None, capath=None, cadata=Non
     return create_pinned_default_context()
 
 
+def pinned_urlopen(url, pinned_sha256=None, cafile=None, timeout=10):
+    """Config helper: urlopen() with optional sha256 leaf-cert pinning and a custom CA bundle.
+
+    Returns the response object (use as a context manager). `cafile` defaults to ROOT_CA_FILE. With no pin
+    it's a plain urlopen. Config build steps use it to fetch release archives (e.g. github.io) over https.
+    """
+    context = make_pinned_ssl_context(pinned_sha256, cafile=cafile or ROOT_CA_FILE) if pinned_sha256 else None
+    return urlopen(url, timeout=timeout, context=context)
+
+
 def _github_get_json(path):
     """Unauthenticated GET against the public GitHub REST API; returns parsed JSON.
 
     Raises MikException on any transport/HTTP error so callers can bucket the failure. A User-Agent is
-    required by GitHub or it answers 403. If GITHUB_CERT_SHA256 is set (in config), api.github.com's
-    certificate is pinned; GITHUB_CA_FILE optionally supplies the CA bundle.
+    required by GitHub or it answers 403. If GITHUB_COM_CERT_SHA256 is set (in config), api.github.com's
+    certificate is pinned; ROOT_CA_FILE optionally supplies the CA bundle.
     """
     req = Request(
         f"{GITHUB_API}{path}",
         headers={"Accept": "application/vnd.github+json", "User-Agent": "mik"},
     )
-    context = make_pinned_ssl_context(GITHUB_CERT_SHA256, cafile=GITHUB_CA_FILE) if GITHUB_CERT_SHA256 else None
+    context = make_pinned_ssl_context(GITHUB_COM_CERT_SHA256, cafile=ROOT_CA_FILE) if GITHUB_COM_CERT_SHA256 else None
     try:
         with urlopen(req, timeout=10, context=context) as resp:
             return json.loads(resp.read().decode())
@@ -1028,7 +1038,7 @@ def _print_ci_grouped(results):
 def ci_status(args):
     """Report default-branch pipeline state for one project, or for every project with a github_repo (ALL).
 
-    Returns -1 if any reported project is a pipeline failure or couldn't be fetched, else 0 — so
+    Returns 1 if any reported project is a pipeline failure or couldn't be fetched, else 0 — so
     `mik ci-status ALL` doubles as a scriptable "is everything green?" gate.
     """
     projects = get_projects()
@@ -1040,7 +1050,7 @@ def ci_status(args):
             return
         results = _fetch_all_ci(items)
         _print_ci_grouped(results)
-        return -1 if any(r["state"] in _CI_RED_STATES for r in results) else 0
+        return 1 if any(r["state"] in _CI_RED_STATES for r in results) else 0
     project = projects.get(target)
     if not project:
         raise MikException(f"{Color.RED.value}Project not found{Color.WHITE.value}")
@@ -1048,7 +1058,7 @@ def ci_status(args):
         raise MikException(f"{Color.RED.value}Project has no github_repo{Color.WHITE.value}")
     result = _fetch_ci_status(target, project.github_repo)
     _print_ci_line(result)
-    return -1 if result["state"] in _CI_RED_STATES else 0
+    return 1 if result["state"] in _CI_RED_STATES else 0
 
 
 def load_config():
@@ -1167,9 +1177,9 @@ if __name__ == "__main__":
         exit(main())
     except KeyboardInterrupt:
         print("\n  !!  KeyboardInterrupt received  !!  \n")
-        exit(-2)
+        exit(130)  # conventional 128 + SIGINT(2)
     except MikException as exc:
         print(f"{Color.RED.value}\n  !!  {exc}  !!  \n{Color.WHITE.value}")
-        exit(-1)
+        exit(1)
     except Exception:
         raise
