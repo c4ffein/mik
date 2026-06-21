@@ -490,5 +490,147 @@ class CiStatusTests(unittest.TestCase):
         self.assertTrue(any("No projects with a github_repo" in str(c.args[0]) for c in p.call_args_list))
 
 
+def _remote_cmds(rs_mock):
+    """Each run_step() call flattened to a single string, for substring/order assertions."""
+    out = []
+    for c in rs_mock.call_args_list:
+        cmda = c.args[0]
+        out.append(" ".join(cmda) if isinstance(cmda, list) else str(cmda))
+    return out
+
+
+class DeployReleaseTests(unittest.TestCase):
+    """deploy_release ships an already-built artifact via scp/ssh as the (unprivileged) ssh user — no sudo.
+    We mock pop (the writability preflight) + run_step + sleep and assert the exact remote command sequence."""
+
+    R = "/var/www/site/releases"
+
+    def _src(self, d):
+        """A finished artifact dir (what build_artifact would have produced) under tmp dir `d`."""
+        src = Path(d) / "1750000000-dist"
+        src.mkdir(parents=True)
+        (src / "index.html").write_text("<html>")
+        (src / "bundle.YYY.js").write_text("//y")
+        return src
+
+    @staticmethod
+    def _idx(cmds, sub):
+        return next(i for i, c in enumerate(cmds) if sub in c)
+
+    @staticmethod
+    def _idx_exact(cmds, whole):
+        return next(i for i, c in enumerate(cmds) if c == whole)
+
+    def test_overlap_sequence(self):
+        with tempfile.TemporaryDirectory() as d:
+            src = self._src(d)
+            sleep_pos = []
+            with mock.patch.object(mik, "pop", return_value=(0, b"", b"")) as pop, mock.patch.object(
+                mik, "run_step"
+            ) as rs, mock.patch.object(
+                mik, "sleep", side_effect=lambda s: sleep_pos.append(rs.call_count)
+            ) as slp, mock.patch("builtins.print"):
+                mik.deploy_release(
+                    src, "user@host", "/var/www/site", release_id="123", name="site", keep=5, overlap_seconds=30
+                )
+
+            pop.assert_called_once()  # writability preflight ran
+            slp.assert_called_once_with(30)  # one wait, the configured window
+
+            cmds = _remote_cmds(rs)
+            ship_clear = self._idx_exact(cmds, f"ssh user@host rm -rf {self.R}/.mik-STAGING-123")
+            scp = self._idx(cmds, "scp -r")
+            self.assertIn(str(src), cmds[scp])  # ships the artifact dir itself, no local copy
+            self.assertIn(f"user@host:{self.R}/.mik-STAGING-123", cmds[scp])
+            promote = self._idx(cmds, f"mv {self.R}/.mik-STAGING-123 {self.R}/123")
+            # world-readable before the mv, so the release is born readable
+            self.assertIn("chmod -R a+rX", cmds[promote])
+            self.assertLess(cmds[promote].index("chmod"), cmds[promote].index(f"mv {self.R}/.mik-STAGING-123"))
+            overlap_build = self._idx(cmds, "cp -rL /var/www/site/current/.")
+            ov_flip = self._idx(cmds, "ln -sfn releases/.mik-OVERLAP-123")
+            clean_flip = self._idx(cmds, "ln -sfn releases/123")
+            rm_overlap = self._idx_exact(cmds, f"ssh user@host rm -rf {self.R}/.mik-OVERLAP-123")
+            prune = self._idx(cmds, "head -n -5")
+
+            # strict ordering: clear -> ship -> promote -> build union -> flip-to-union -> SLEEP -> flip-to-clean
+            for earlier, later in zip(
+                [ship_clear, scp, promote, overlap_build, ov_flip, clean_flip, rm_overlap],
+                [scp, promote, overlap_build, ov_flip, clean_flip, rm_overlap, prune],
+            ):
+                self.assertLess(earlier, later)
+            # the union is served before the wait, the clean release only after it
+            self.assertLess(ov_flip, sleep_pos[0])
+            self.assertLessEqual(sleep_pos[0], clean_flip)
+            # both flips are an atomic rename over `current`
+            self.assertIn("mv -T", cmds[ov_flip])
+            self.assertIn("mv -T", cmds[clean_flip])
+            # the whole thing runs without sudo (user owns the web root)
+            self.assertFalse(any("sudo" in c for c in cmds))
+
+    def test_no_overlap_when_zero_seconds(self):
+        with tempfile.TemporaryDirectory() as d:
+            src = self._src(d)
+            with mock.patch.object(mik, "pop", return_value=(0, b"", b"")), mock.patch.object(
+                mik, "run_step"
+            ) as rs, mock.patch.object(mik, "sleep") as slp, mock.patch("builtins.print"):
+                mik.deploy_release(src, "user@host", "/var/www/site", release_id="123", name="site", overlap_seconds=0)
+            slp.assert_not_called()
+            cmds = _remote_cmds(rs)
+            # no union built/flipped/torn-down — straight to the clean release
+            self.assertFalse(any("cp -rL /var/www/site/current/." in c for c in cmds))
+            self.assertFalse(any("ln -sfn releases/.mik-OVERLAP-123" in c for c in cmds))
+            self.assertFalse(any(c == f"ssh user@host rm -rf {self.R}/.mik-OVERLAP-123" for c in cmds))
+            self.assertTrue(any("ln -sfn releases/123" in c for c in cmds))
+
+    def test_unwritable_site_root_raises_before_side_effects(self):
+        with mock.patch.object(mik, "pop", return_value=(1, b"Permission denied", b"")), mock.patch.object(
+            mik, "run_step"
+        ) as rs, mock.patch.object(mik, "sleep"):
+            with self.assertRaises(mik.MikException) as cm:
+                mik.deploy_release("/tmp/x", "user@host", "/var/www/site", release_id="123", name="site")
+            self.assertIn("not writable", str(cm.exception))
+            rs.assert_not_called()  # no scp/ssh side effect once the preflight fails
+
+    def test_rejects_unsafe_inputs_before_any_remote_call(self):
+        bad = [
+            dict(release_id="1 2"),  # space -> not alnum
+            dict(release_id="a/b"),  # slash -> not alnum
+            dict(keep=0),  # head -n -0 would wipe the live release
+            dict(site_root="relative/path"),  # not absolute
+            dict(site_root="/a/../b"),  # traversal
+            dict(ssh_host="a b@host"),  # space in ssh user
+        ]
+        base = dict(
+            src="/tmp/whatever",
+            ssh_host="user@host",
+            site_root="/var/www/site",
+            release_id="123",
+            name="site",
+        )
+        for override in bad:
+            with mock.patch.object(mik, "pop") as pop, mock.patch.object(mik, "run_step") as rs, mock.patch.object(
+                mik, "sleep"
+            ):
+                with self.assertRaises(mik.MikException, msg=override):
+                    mik.deploy_release(**{**base, **override})
+                pop.assert_not_called()  # validation precedes even the preflight
+                rs.assert_not_called()
+
+    def test_prune_failure_does_not_fail_deploy(self):
+        with tempfile.TemporaryDirectory() as d:
+            src = self._src(d)
+
+            def boom_on_prune(cmda, *a, **k):
+                if any("head -n" in str(x) for x in cmda):
+                    raise mik.MikException("prune blew up")
+                return b""
+
+            with mock.patch.object(mik, "pop", return_value=(0, b"", b"")), mock.patch.object(
+                mik, "run_step", side_effect=boom_on_prune
+            ), mock.patch.object(mik, "sleep"), mock.patch("builtins.print") as p:
+                mik.deploy_release(src, "user@host", "/var/www/site", release_id="123", name="site", overlap_seconds=0)
+            self.assertTrue(any("deployed site" in line for line in _printed(p)))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

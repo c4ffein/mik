@@ -13,6 +13,7 @@ import traceback
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from enum import Enum
+from time import sleep
 from hashlib import sha256
 from ssl import (
     CERT_NONE,
@@ -48,6 +49,7 @@ __all__ = [
     "debug",
     "pop",
     "run_step",
+    "deploy_release",
     "run_and_capture",
     "record_run",
     "make_pinned_ssl_context",
@@ -68,6 +70,7 @@ __all__ = [
 # - update system, track remote versions
 # - reboot command
 # - better data model, deploy a project to an instance, let an instance backup multiple projects...
+# - `help <command>` surfacing the relevant helper docstring (e.g. `help deploy` -> deploy_release)
 
 
 CONFIG_FILE = Path.home() / ".config/mik/config.py"
@@ -638,6 +641,143 @@ def validate_code_dir(s):
     for c in s:
         if ord(c) not in _valid_code_dir_ords:
             raise MikException(f"bad char {c!r} in code_dir: {s!r}")
+
+
+def _flip_current(ssh_host, site_root, target):
+    """Atomically point {site_root}/current at `target` (a path *relative to site_root*).
+
+    rename(2) is the only atomic replace — symlink(2) refuses to overwrite — so the canonical move is to
+    materialise the new link under a temp name, then rename it onto `current`. `ln -sfn` builds (or
+    overwrites a crash-leftover of) that temp link in one (non-atomic) step (`-f` force, `-n` so it never
+    descends into a leftover symlink-to-a-dir), and `mv -T` does the atomic rename, so a serving nginx never
+    sees `current` momentarily absent. The temp name is fixed, so a crash leaves at most one stale link that
+    the next flip reclaims — the two flips are sequential, never concurrent, so they can share it.
+
+    No sudo: the web root is owned by the ssh user (see deploy_release). Precondition: caller passes
+    already-validated, shell-safe `ssh_host`/`site_root` and a relative `target` composed from them.
+    """
+    tmp = f"{site_root}/.mik-cur-tmp"
+    run_step(["ssh", ssh_host, f"ln -sfn {target} {tmp} && mv -T {tmp} {site_root}/current"])
+
+
+def deploy_release(src, ssh_host, site_root, release_id, name, keep=5, overlap_seconds=30):
+    """Atomic zero-downtime deploy of an already-built artifact. No rsync, no shell pipes, no sudo.
+
+    Config helper — the *deploy* half of build/deploy. `src` is a finished artifact directory (typically
+    from latest_release()/resolve_release()); choosing, excluding and transforming files is the *build*
+    step's job (see build_artifact), so this ships src as-is. It scp's src into {site_root}/releases/{id},
+    makes it world-readable, then flips the `current` symlink the web server serves through — picked up on
+    the next request, no reload. Fresh dir per release => no stale files; the artifact we serve long-term
+    is always one pristine release.
+
+    Runs entirely as the ssh user — *no sudo*. The web root must be owned/writable by that user (a one-time
+    `chown -R <user> {site_root}`); a preflight check fails fast with that instruction if it isn't. A
+    containerized web server serving from a bind mount reads files by their world-readable ("other") bits
+    regardless of host ownership, which is why each release is `chmod -R a+rX`'d before it's served.
+
+    When overlap_seconds > 0, `current` is first flipped for that many seconds to a *transient union* of
+    the previous release and the new one (new winning on shared names like index.html), then flipped to
+    the clean new release. This covers the race where a browser fetched the old index.html moments before
+    the deploy and then requests an old hashed bundle the clean release no longer has: during the window
+    both old and new hashed assets are served while index.html is already the new one. The union is never
+    served long-term — so every served-forever release is still a single, individually-built artifact.
+
+    What the overlap actually covers (i.e. when this helper is sufficient on its own). A 404 only happens
+    when a browser holds an OLD index.html and then requests an OLD bundle the now-current release dropped.
+    Two cases, given index.html is served `Cache-Control: no-cache` (else the browser reuses a hard-cached
+    old index and nothing server-side can help):
+      - Eager bundles (no code-splitting — the common static-site case): the only exposure is a tab caught
+        *mid-initial-load* when the flip lands, a seconds-wide race (a frozen, fully-loaded tab already has
+        its bundles and is safe). overlap_seconds=30 comfortably contains that race => SUFFICIENT, this is
+        effectively zero-downtime on its own.
+      - Lazy / code-split chunks (`import()` on navigation, React.lazy): a tab can sit open for hours, then
+        request an old chunk for the first time. The window is unbounded => this overlap is only PARTIAL;
+        the tail needs a client-side reload-on-ChunkLoadError / vite:preloadError handler, which then owns
+        correctness and makes the overlap mere polish.
+
+    Inputs land in a remote shell and in paths, so they're validated up front. Needs GNU head/xargs on
+    the remote (Debian has both).
+    """
+    rid = str(release_id)
+    if not rid.isalnum():  # lands in a remote shell + a path — keep it boring
+        raise MikException(f"unsafe release_id: {rid!r}")
+    if int(keep) < 1:  # keep=0 => GNU `head -n -0` prints every line => prune would delete the live release
+        raise MikException("keep must be >= 1")
+    validate_code_dir(site_root)  # absolute, no '..', boring chars — it's interpolated into a remote target
+    for part in ssh_host.split("@"):
+        try:
+            validate_name(part)
+        except Exception as exc:
+            raise MikException(f"unsafe ssh_host: {ssh_host!r}") from exc
+    # Invariant from here on: rid is alnum and site_root is a clean absolute path, so every remote string
+    # composed below ({site_root}/releases/{rid}, .mik-STAGING-{rid}, .mik-OVERLAP-{rid}, ...) is shell-safe
+    # by construction. That's why the sinks below — including _flip_current — interpolate without re-checking.
+    # (`name` is a log label only — it no longer reaches a shell or a path — so it needs no validation.)
+    releases_dir = f"{site_root}/releases"  # holds every release for this instance, plus current's targets
+    new_release_dir = f"{releases_dir}/{rid}"  # the immutable release we ultimately serve
+    new_release_rel = f"releases/{rid}"  # same dir, relative to site_root — the symlink target
+    staging_dir = f"{releases_dir}/.mik-STAGING-{rid}"  # transient upload target (dotfile: ignored by prune)
+    overlap_dir = f"{releases_dir}/.mik-OVERLAP-{rid}"  # transient previous-∪-new union (dotfile: ignored by prune)
+    overlap_rel = f"releases/.mik-OVERLAP-{rid}"  # the union dir, relative to site_root — the symlink target
+    # 0. preflight: make releases/ and confirm it's writable AS THE SSH USER, so we fail with an actionable
+    #    message instead of a cryptic scp/rm permission error mid-deploy. Everything below runs without sudo.
+    rc, err, _ = pop(["ssh", ssh_host, f"mkdir -p {releases_dir} && test -w {releases_dir}"])
+    if rc != 0:
+        raise MikException(
+            f"{releases_dir} is not writable over ssh as {ssh_host} (rc={rc}). mik deploys without sudo — "
+            f"own the web root with the deploy user, e.g. `ssh {ssh_host} sudo chown -R \\$USER {site_root}`."
+        )
+    # 1. ship the built artifact as-is (scp = argv, no shell), clearing any half-done previous attempt
+    run_step(["ssh", ssh_host, f"rm -rf {staging_dir}"])
+    run_step(["scp", "-r", str(src), f"{ssh_host}:{staging_dir}"])
+    # 2. make the upload world-readable (a containerized server reads by 'other' bits), then promote it to a
+    #    fresh immutable release dir — same filesystem, so the mv is an atomic rename. `a+rX` before the mv
+    #    means the release is born readable: `current` never points at a not-yet-chmod'd dir.
+    run_step(
+        [
+            "ssh",
+            ssh_host,
+            " && ".join(
+                [
+                    f"chmod -R a+rX {staging_dir}",
+                    f"rm -rf {new_release_dir} {overlap_dir}",  # clear leftovers from a crashed run of this rid
+                    f"mv {staging_dir} {new_release_dir}",
+                ]
+            ),
+        ]
+    )
+    # 3. optional transient overlap: serve (previous ∪ new, new winning) — see the docstring for what this
+    #    window does and doesn't cover. `current` still points at the previous release here, so `current/.`
+    #    seeds the union with the old files; first deploy => the `|| true` leaves it empty and the union is
+    #    just the new release (the sleep is then a harmless no-op).
+    if overlap_seconds and overlap_seconds > 0:
+        run_step(
+            [
+                "ssh",
+                ssh_host,
+                " && ".join(
+                    [
+                        f"mkdir -p {overlap_dir}",
+                        f"cp -rL {site_root}/current/. {overlap_dir}/ 2>/dev/null || true",
+                        f"cp -rL {new_release_dir}/. {overlap_dir}/",  # merge new in — new wins on shared names
+                        f"chmod -R a+rX {overlap_dir}",
+                    ]
+                ),
+            ]
+        )
+        _flip_current(ssh_host, site_root, overlap_rel)
+        sleep(overlap_seconds)
+    # 4. flip `current` to the clean release (atomic rename, never absent), then drop the overlap dir
+    _flip_current(ssh_host, site_root, new_release_rel)
+    if overlap_seconds and overlap_seconds > 0:
+        run_step(["ssh", ssh_host, f"rm -rf {overlap_dir}"])
+    # 5. prune old releases (best-effort; failure here must not fail the deploy)
+    prune = f"cd {releases_dir} && ls -1 | sort -n | head -n -{int(keep)} | xargs -r -I REPLACE rm -rf REPLACE"
+    try:
+        run_step(["ssh", ssh_host, prune])
+    except MikException as exc:
+        debug(f"prune failed (ignored): {exc}")
+    print(f"deployed {name} -> {site_root}/current (release {rid})")
 
 
 # This is the validation logic inlined as a string for remote scripts (no re, no imports beyond builtins)

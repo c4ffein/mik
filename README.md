@@ -89,9 +89,13 @@ class MyServer(Instance):
 mik exposes a set of helpers in the config namespace for exactly this: a local
 artifact store (`build_artifact`, `latest_release`, `resolve_release`,
 `prune_artifacts`, `artifact_category_dir`), shell runners (`run_step`, `pop`,
-`run_and_capture`, `record_run`), and `pinned_urlopen` / `make_pinned_ssl_context`
-for fetching over TLS with optional leaf-cert pinning. See `mik.py` (`__all__`)
-for the full list.
+`run_and_capture`, `record_run`), `deploy_release` (zero-downtime static deploy:
+ships a directory to the remote as an immutable release and atomically flips the
+`current` symlink the web server serves through, with an optional overlap window
+to smooth hashed-bundle upgrades), and `pinned_urlopen` / `make_pinned_ssl_context`
+for fetching over TLS with optional leaf-cert pinning. Each helper's full
+signature and semantics live in its docstring in `mik.py` (see `__all__` for the
+list; a `mik help <command>` surfacing them is on the TODO list).
 
 ## Commands
 
