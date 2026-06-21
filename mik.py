@@ -580,10 +580,10 @@ _valid_name_ords = (
 
 def validate_name(s):
     metone = False
-    for i in range(len(s)):
-        if ord(s[i]) not in _valid_name_ords:
-            raise MikException(f"Found bad char {ord(s[i])} (printed {s[i]}) when trying to validate a name")
-        if s[i] != ".":
+    for c in s:
+        if ord(c) not in _valid_name_ords:
+            raise MikException(f"Found bad char {ord(c)} (printed {c}) when trying to validate a name")
+        if c != ".":
             metone = True
     if not metone:
         raise MikException("Validating a name needs at least one char that is not a dot")
