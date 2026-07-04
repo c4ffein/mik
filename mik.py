@@ -640,11 +640,13 @@ _valid_path_ords = (
     ord("_"),
 )
 
-# Exact matches and prefixes that are forbidden in any path component
-# .git prefix catches .git/, .gitattributes, .gitmodules, .githooks, etc.
+# Fail closed on git-control files: a hostile pod must not slip us a .git dir, .gitattributes, .gitmodules,
+# .githooks/, etc. — they hijack checkout/filter/hook behavior. So we deny the whole ".git" prefix and poke
+# explicit holes only for known-safe exceptions: .gitignore, .github/** (CI/workflows/templates), .gitkeep.
+# Anything else starting with ".git" is rejected by default — add it here consciously if you need it.
 FORBIDDEN_PATH_PARTS = {"node_modules", "__pycache__"}
 FORBIDDEN_PATH_PREFIXES = (".git",)
-ALLOWED_PATH_PARTS = {".gitignore"}
+ALLOWED_PATH_PARTS = {".gitignore", ".github", ".gitkeep"}
 
 
 def validate_path(p):
@@ -831,7 +833,7 @@ _vpo = (
 )
 _forbidden_parts = {"node_modules", "__pycache__"}
 _forbidden_prefixes = (".git",)
-_allowed_parts = {".gitignore"}
+_allowed_parts = {".gitignore", ".github", ".gitkeep"}
 def validate_path(p):
     if not p or p.startswith("/"):
         return False

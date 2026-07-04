@@ -34,12 +34,32 @@ class ValidatePathTests(unittest.TestCase):
         for p in ("a.txt", "src/main.py", "a/b/c/d.json", ".gitignore", "dir/.gitignore"):
             self.assertTrue(mik.validate_path(p), p)
 
+    def test_accepts_allowlisted_dotgit_exceptions(self):
+        # Regression: the ".git" prefix ban must not swallow these explicitly-allowed, known-safe
+        # names. .github/** (CI/workflows/templates) is the whole point of the exception.
+        for p in (
+            ".github/workflows/ci.yml",
+            ".github/CODEOWNERS",
+            ".github/ISSUE_TEMPLATE/bug.md",
+            "dir/.github/x",
+            ".gitkeep",
+            "sub/.gitkeep",
+        ):
+            self.assertTrue(mik.validate_path(p), p)
+
     def test_rejects_traversal_and_absolute(self):
         for p in ("/etc/passwd", "../secret", "a/../b", "", "a//b"):
             self.assertFalse(mik.validate_path(p), p)
 
     def test_rejects_git_and_known_junk(self):
-        for p in (".git/config", ".gitmodules", "node_modules/x", "a/__pycache__/b.pyc"):
+        # The real repo-hijack vectors stay blocked (they alter checkout/filter/hook behavior).
+        for p in (".git/config", ".gitmodules", ".gitattributes", "node_modules/x", "a/__pycache__/b.pyc"):
+            self.assertFalse(mik.validate_path(p), p)
+
+    def test_unknown_dotgit_is_denied_by_default(self):
+        # Fail-closed: anything starting with ".git" that isn't explicitly allowlisted is rejected,
+        # even if plausibly benign. Add it to ALLOWED_PATH_PARTS consciously if you actually need it.
+        for p in (".gitlab-ci.yml", ".gitpod.yml", ".githooks/pre-commit", ".gitconfig", ".git-blame-ignore-revs"):
             self.assertFalse(mik.validate_path(p), p)
 
     def test_rejects_weird_chars(self):
