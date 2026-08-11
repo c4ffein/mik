@@ -5,6 +5,7 @@ Tested at the CLI/effect boundary (args in -> subprocess / HTTP / file effects o
 internals, mocking the subprocess / SSH / HTTP layers. Stdlib only; run with `make test` or `python test.py`.
 """
 
+import contextlib
 import io
 import json
 import os
@@ -382,9 +383,10 @@ class DevFetchPodTests(unittest.TestCase):
         fetch_resp = mik.base64.b64encode(json.dumps(fetch_payload).encode())
         with tempfile.TemporaryDirectory() as d:
             self._setup(d)
-            with mock.patch.object(
-                mik, "_run_remote_script", side_effect=[(0, b"", list_resp), (0, b"", fetch_resp)]
-            ), mock.patch("builtins.input", return_value="y"):
+            with (
+                mock.patch.object(mik, "_run_remote_script", side_effect=[(0, b"", list_resp), (0, b"", fetch_resp)]),
+                mock.patch("builtins.input", return_value="y"),
+            ):
                 with self.assertRaises(mik.MikException):
                     mik.dev_fetch_pod(SimpleNamespace(instance="inst"))
             self.assertFalse((Path(d) / "evil.txt").exists())
@@ -396,9 +398,10 @@ class DevFetchPodTests(unittest.TestCase):
         fetch_resp = mik.base64.b64encode(json.dumps(fetch_payload).encode())
         with tempfile.TemporaryDirectory() as d:
             self._setup(d)
-            with mock.patch.object(
-                mik, "_run_remote_script", side_effect=[(0, b"", list_resp), (0, b"", fetch_resp)]
-            ), mock.patch("builtins.input", return_value="y"):
+            with (
+                mock.patch.object(mik, "_run_remote_script", side_effect=[(0, b"", list_resp), (0, b"", fetch_resp)]),
+                mock.patch("builtins.input", return_value="y"),
+            ):
                 mik.dev_fetch_pod(SimpleNamespace(instance="inst"))
             self.assertEqual((Path(d) / "a.txt").read_bytes(), b"hello")
 
@@ -457,8 +460,9 @@ class PinnedSslTests(unittest.TestCase):
             captured["context"] = context
             return _FakeResp(b'{"ok": true}')
 
-        with mock.patch.object(mik, "GITHUB_COM_CERT_SHA256", self.PIN), mock.patch.object(
-            mik, "urlopen", fake_urlopen
+        with (
+            mock.patch.object(mik, "GITHUB_COM_CERT_SHA256", self.PIN),
+            mock.patch.object(mik, "urlopen", fake_urlopen),
         ):
             out = mik._github_get_json("/repos/o/r")
         self.assertEqual(out, {"ok": True})
@@ -632,11 +636,12 @@ class DeployReleaseTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             src = self._src(d)
             sleep_pos = []
-            with mock.patch.object(mik, "pop", return_value=(0, b"", b"")) as pop, mock.patch.object(
-                mik, "run_step"
-            ) as rs, mock.patch.object(
-                mik, "sleep", side_effect=lambda s: sleep_pos.append(rs.call_count)
-            ) as slp, mock.patch("builtins.print"):
+            with (
+                mock.patch.object(mik, "pop", return_value=(0, b"", b"")) as pop,
+                mock.patch.object(mik, "run_step") as rs,
+                mock.patch.object(mik, "sleep", side_effect=lambda s: sleep_pos.append(rs.call_count)) as slp,
+                mock.patch("builtins.print"),
+            ):
                 mik.deploy_release(
                     src, "user@host", "/var/www/site", release_id="123", name="site", keep=5, overlap_seconds=30
                 )
@@ -677,9 +682,12 @@ class DeployReleaseTests(unittest.TestCase):
     def test_no_overlap_when_zero_seconds(self):
         with tempfile.TemporaryDirectory() as d:
             src = self._src(d)
-            with mock.patch.object(mik, "pop", return_value=(0, b"", b"")), mock.patch.object(
-                mik, "run_step"
-            ) as rs, mock.patch.object(mik, "sleep") as slp, mock.patch("builtins.print"):
+            with (
+                mock.patch.object(mik, "pop", return_value=(0, b"", b"")),
+                mock.patch.object(mik, "run_step") as rs,
+                mock.patch.object(mik, "sleep") as slp,
+                mock.patch("builtins.print"),
+            ):
                 mik.deploy_release(src, "user@host", "/var/www/site", release_id="123", name="site", overlap_seconds=0)
             slp.assert_not_called()
             cmds = _remote_cmds(rs)
@@ -690,9 +698,11 @@ class DeployReleaseTests(unittest.TestCase):
             self.assertTrue(any("ln -sfn releases/123" in c for c in cmds))
 
     def test_unwritable_site_root_raises_before_side_effects(self):
-        with mock.patch.object(mik, "pop", return_value=(1, b"Permission denied", b"")), mock.patch.object(
-            mik, "run_step"
-        ) as rs, mock.patch.object(mik, "sleep"):
+        with (
+            mock.patch.object(mik, "pop", return_value=(1, b"Permission denied", b"")),
+            mock.patch.object(mik, "run_step") as rs,
+            mock.patch.object(mik, "sleep"),
+        ):
             with self.assertRaises(mik.MikException) as cm:
                 mik.deploy_release("/tmp/x", "user@host", "/var/www/site", release_id="123", name="site")
             self.assertIn("not writable", str(cm.exception))
@@ -715,8 +725,10 @@ class DeployReleaseTests(unittest.TestCase):
             name="site",
         )
         for override in bad:
-            with mock.patch.object(mik, "pop") as pop, mock.patch.object(mik, "run_step") as rs, mock.patch.object(
-                mik, "sleep"
+            with (
+                mock.patch.object(mik, "pop") as pop,
+                mock.patch.object(mik, "run_step") as rs,
+                mock.patch.object(mik, "sleep"),
             ):
                 with self.assertRaises(mik.MikException, msg=override):
                     mik.deploy_release(**{**base, **override})
@@ -728,8 +740,10 @@ class DeployReleaseTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             src = self._src(d)
             (src / "sneaky").symlink_to("/etc/passwd")
-            with mock.patch.object(mik, "pop") as pop, mock.patch.object(mik, "run_step") as rs, mock.patch.object(
-                mik, "sleep"
+            with (
+                mock.patch.object(mik, "pop") as pop,
+                mock.patch.object(mik, "run_step") as rs,
+                mock.patch.object(mik, "sleep"),
             ):
                 with self.assertRaises(mik.MikException) as cm:
                     mik.deploy_release(src, "user@host", "/var/www/site", release_id="123", name="site")
@@ -746,11 +760,38 @@ class DeployReleaseTests(unittest.TestCase):
                     raise mik.MikException("prune blew up")
                 return b""
 
-            with mock.patch.object(mik, "pop", return_value=(0, b"", b"")), mock.patch.object(
-                mik, "run_step", side_effect=boom_on_prune
-            ), mock.patch.object(mik, "sleep"), mock.patch("builtins.print") as p:
+            with (
+                mock.patch.object(mik, "pop", return_value=(0, b"", b"")),
+                mock.patch.object(mik, "run_step", side_effect=boom_on_prune),
+                mock.patch.object(mik, "sleep"),
+                mock.patch("builtins.print") as p,
+            ):
                 mik.deploy_release(src, "user@host", "/var/www/site", release_id="123", name="site", overlap_seconds=0)
             self.assertTrue(any("deployed site" in line for line in _printed(p)))
+
+
+class ReadmeSyncTests(unittest.TestCase):
+    def test_help_matches_readme(self):
+        """The README's ## Help code block must match `mik --help` byte-for-byte.
+
+        If this fails, regenerate the block: COLUMNS=80 python3 mik.py (argparse wraps to the
+        terminal width, so the width is pinned here to keep the rendering deterministic).
+        """
+        buf = io.StringIO()
+        # Pin prog name (argv[0]) and terminal width so the argparse rendering is deterministic.
+        with mock.patch.object(mik.sys, "argv", ["mik"]), mock.patch.dict(os.environ, {"COLUMNS": "80"}):
+            with contextlib.redirect_stdout(buf):
+                mik.main()  # no sub-command -> parser.print_help(), returns before load_config()
+        help_text = buf.getvalue()
+        readme = (Path(__file__).parent / "README.md").read_text()
+        help_section = readme.find("## Help")
+        self.assertNotEqual(help_section, -1, "README should have a '## Help' section")
+        fence_open = readme.find("```", help_section)
+        self.assertNotEqual(fence_open, -1, "README should have a code block after ## Help")
+        block_start = readme.index("\n", fence_open) + 1
+        block_end = readme.find("```", block_start)
+        self.assertNotEqual(block_end, -1, "README code block should be closed")
+        self.assertEqual(help_text, readme[block_start:block_end], "README ## Help block is out of sync with --help")
 
 
 if __name__ == "__main__":

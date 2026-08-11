@@ -140,3 +140,33 @@ is checked against exactly what you confirmed before anything is written.
 `deploy` and `get-remote-source` stream their output live while capturing it,
 and persist one JSON record per run (combined output, return code, timing)
 under `~/.local/state/mik/runs/` for later inspection.
+
+## Help
+
+Raw `mik --help` output (kept in sync with the code by `test.py`, rendered at 80 columns):
+
+```
+usage: mik [-h] [--debug]
+           {list,list-machines,list-instances,list-projects,deploy,build,get-remote-source,dev-fetch-pod,ci-status,autocomplete} ...
+
+mik
+
+positional arguments:
+  {list,list-machines,list-instances,list-projects,deploy,build,get-remote-source,dev-fetch-pod,ci-status,autocomplete}
+                        sub-command help
+    list                list everything: instances and projects with their
+                        links
+    list-machines       list machines
+    list-instances      list instances
+    list-projects       list projects
+    deploy              deploy an instance
+    build               build an instance's local artifact
+    get-remote-source   run an instance's get_remote_source
+    dev-fetch-pod       Fetch changed files from an instance's container
+    ci-status           Check default-branch pipeline status (or ALL)
+    autocomplete        autocomplete help
+
+options:
+  -h, --help            show this help message and exit
+  --debug               enable debug output
+```

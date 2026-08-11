@@ -1,4 +1,4 @@
-.PHONY: help lint lint-check format-check test fast-validate
+.PHONY: help lint lint-check format-check test fast-validate verify
 
 help:
 	@echo "mik - Makefile commands"
@@ -8,6 +8,7 @@ help:
 	@echo "  make format-check  - Check formatting without fixing"
 	@echo "  make test          - Run the test suite"
 	@echo "  make fast-validate - Run lint-check + format-check + test"
+	@echo "  make verify        - Read-only gate: pinned ruff check + test suite (no env needed)"
 
 lint:
 	uv run ruff check --fix; uv run ruff format
@@ -22,3 +23,9 @@ test:
 	uv run python test.py
 
 fast-validate: lint-check format-check test
+
+# Read-only "is this ready?" gate, shared shape across the collection. Runs ruff pinned to the
+# version resolved in uv.lock (throwaway via uvx, no venv) + the stdlib-only test suite directly.
+verify:
+	uvx ruff@0.15.20 check --no-fix .
+	python3 test.py

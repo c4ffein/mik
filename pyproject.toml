@@ -1,7 +1,7 @@
 [project]
 name = "mik"
 version = "0.0.4"
-requires-python = ">=3.8"
+requires-python = ">=3.11"
 
 [tool.uv]
 # mik ships via setup.py (scripts/mik); uv is only used here to manage the dev env, not to build it.
@@ -9,7 +9,7 @@ package = false
 
 [tool.ruff]
 line-length = 120
-target-version = "py38"
+target-version = "py311"
 
 [tool.ruff.format]
 # ruff format replaces black

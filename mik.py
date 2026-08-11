@@ -7,6 +7,7 @@ from pathlib import Path
 import subprocess
 import shutil
 import tarfile
+import tempfile
 import string
 import base64
 import os
@@ -420,7 +421,21 @@ def record_run(command, target, started_at, finished_at, returncode, output):
             "returncode": returncode,
             "output": output,
         }
-        (RUNS_DIR / f"{run_id}.json").write_text(json.dumps(record, indent=2))
+        # Atomic write: same-dir temp + replace, so a crash mid-write can't leave a torn record.
+        # mkstemp's 0600 is kept on purpose: the captured output embeds whatever the deploy printed.
+        fd, tmp_path = tempfile.mkstemp(dir=RUNS_DIR, prefix=f"{run_id}.", suffix=".tmp")
+        try:
+            try:
+                os.write(fd, json.dumps(record, indent=2).encode())
+            finally:
+                os.close(fd)
+            os.replace(tmp_path, RUNS_DIR / f"{run_id}.json")
+        except BaseException:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+            raise
         debug(f"recorded run {run_id} (rc={returncode})")
         return run_id
     except Exception as exc:
@@ -1020,7 +1035,26 @@ def dev_fetch_pod(args):
     for fpath, content_b64 in payload.get("files", {}).items():
         dest = local / fpath
         dest.parent.mkdir(parents=True, exist_ok=True)
-        dest.write_bytes(base64.b64decode(content_b64))
+        # Atomic write: same-dir temp + replace, so a failure mid-fetch can't leave a truncated file.
+        fd, tmp_path = tempfile.mkstemp(dir=dest.parent, prefix=f".{dest.name}.", suffix=".tmp")
+        try:
+            try:
+                os.write(fd, base64.b64decode(content_b64))
+            finally:
+                os.close(fd)
+            if dest.exists():
+                os.chmod(tmp_path, dest.stat().st_mode & 0o7777)  # keep the tracked file's mode (e.g. exec bit)
+            else:
+                umask = os.umask(0)
+                os.umask(umask)
+                os.chmod(tmp_path, 0o666 & ~umask)  # mkstemp gives 0600; a new file should match a plain open()
+            os.replace(tmp_path, dest)
+        except BaseException:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+            raise
         print(f"  {Color.GREEN.value}wrote{Color.WHITE.value}  {fpath}")
         written += 1
     for fpath in payload.get("deleted", []):
