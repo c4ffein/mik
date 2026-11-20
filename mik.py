@@ -55,6 +55,7 @@ __all__ = [
     "run_and_capture",
     "record_run",
     "make_pinned_ssl_context",
+    "configured_pins",
     "pinned_urlopen",
     "ARTIFACTS_DIR",
     "artifact_category_dir",
@@ -1072,11 +1073,17 @@ GITHUB_API = "https://api.github.com"
 # Optional certificate pinning (paranoid mode). Set any of these in your config to pin the sha256 of that
 # host's DER *leaf* cert; ROOT_CA_FILE optionally points at the CA bundle used to verify. Left None, mik
 # behaves exactly as before (urllib's default SSL context, no pinning).
-# NOTE: a leaf pin breaks the moment the host rotates its cert (GitHub / Let's Encrypt do, regularly) — a
-# previously green deploy then fails with "cert pin/verify failed" until you refresh the sha below.
+# A pin is a SHA256 hex digest (a str), or several of them (a list: any is accepted, as the old and the new
+# certificate overlap during a rotation). NOTE: a leaf pin breaks the moment the host rotates its cert (GitHub /
+# Let's Encrypt do, regularly) — a previously green deploy then fails with "cert pin/verify failed" until it
+# is refreshed. The config is Python, so it can ask a command for the current ones instead of hardcoding
+# them, e.g. tls-pin-get from https://github.com/c4ffein/crypto (an argv with a full path: no shell, no ~):
+#   GITHUB_COM_CERT_SHA256 = run_step(["/home/me/.local/bin/tls-pin-get", "api.github.com"]).decode().split()
 ROOT_CA_FILE = None
 GITHUB_COM_CERT_SHA256 = None  # api.github.com (used by ci-status)
 GITHUB_IO_CERT_SHA256 = None  # *.github.io, e.g. c4ffein.github.io release archives (used by config builds)
+HEX_CHARS = frozenset("0123456789abcdef")
+PIN_MAX_COUNT = 16  # the old and the new certificate overlap during a rotation: a few, never many
 
 # Pipeline rollup states (good < pending/no_checks are informational < failure/fetch_error are red)
 CI_GOOD = "good"
@@ -1108,14 +1115,17 @@ def make_pinned_ssl_context(pinned_sha_256, cafile=None, capath=None, cadata=Non
     """
     Returns an instance of a subclass of SSLContext that uses a subclass of SSLSocket
     that actually verifies the sha256 of the certificate during the TLS handshake
+    pinned_sha_256 is a hex digest, or several of them: any is accepted (certificates overlap during a rotation)
     Tested with `python-version: [3.8, 3.9, 3.10, 3.11, 3.12, 3.13]`
     Original code can be found at https://github.com/c4ffein/python-snippets
     """
 
+    pinned = frozenset((pinned_sha_256,) if isinstance(pinned_sha_256, str) else pinned_sha_256)
+
     class PinnedSSLSocket(SSLSocket):
         def check_pinned_cert(self):
             der_cert_bin = self.getpeercert(True)
-            if sha256(der_cert_bin).hexdigest() != pinned_sha_256:
+            if sha256(der_cert_bin).hexdigest() not in pinned:
                 raise SSLCertVerificationError("Incorrect certificate checksum")
 
         def do_handshake(self, *args, **kwargs):
@@ -1150,13 +1160,35 @@ def make_pinned_ssl_context(pinned_sha_256, cafile=None, capath=None, cadata=Non
     return create_pinned_default_context()
 
 
+def configured_pins(value, label="Certificate pin"):
+    """
+    The SHA256 pins that a configured pin accepts, as a tuple, for make_pinned_ssl_context.
+    value is a hex digest, or a list of them. Anything else (no pin, something that is not a SHA256) is an
+    error: no connection is made.
+    """
+    pins = (value,) if isinstance(value, str) else value
+    if not isinstance(pins, (list, tuple)) or not all(isinstance(pin, str) for pin in pins):
+        raise MikException(f"{label} must be a SHA256 or a list of them, got {type(value).__name__}")
+    if not pins:
+        raise MikException(f"{label} has no pin")
+    if len(pins) > PIN_MAX_COUNT:
+        raise MikException(f"{label} has more than {PIN_MAX_COUNT} pins")
+    pins = tuple(pin.lower() for pin in pins)
+    if any(len(pin) != 64 or any(c not in HEX_CHARS for c in pin) for pin in pins):
+        raise MikException(f"{label} has something that is not a SHA256 (64 hex chars)")
+    return pins
+
+
 def pinned_urlopen(url, pinned_sha256=None, cafile=None, timeout=10):
     """Config helper: urlopen() with optional sha256 leaf-cert pinning and a custom CA bundle.
 
-    Returns the response object (use as a context manager). `cafile` defaults to ROOT_CA_FILE. With no pin
-    it's a plain urlopen. Config build steps use it to fetch release archives (e.g. github.io) over https.
+    Returns the response object (use as a context manager). `pinned_sha256` is a hex digest or a list of
+    them (see configured_pins). `cafile` defaults to ROOT_CA_FILE. With no pin (None) it's a plain
+    urlopen. Config build steps use it to fetch release archives (e.g. github.io) over https.
     """
-    context = make_pinned_ssl_context(pinned_sha256, cafile=cafile or ROOT_CA_FILE) if pinned_sha256 else None
+    context = None
+    if pinned_sha256 is not None:
+        context = make_pinned_ssl_context(configured_pins(pinned_sha256), cafile=cafile or ROOT_CA_FILE)
     return urlopen(url, timeout=timeout, context=context)
 
 
@@ -1165,13 +1197,17 @@ def _github_get_json(path):
 
     Raises MikException on any transport/HTTP error so callers can bucket the failure. A User-Agent is
     required by GitHub or it answers 403. If GITHUB_COM_CERT_SHA256 is set (in config), api.github.com's
-    certificate is pinned; ROOT_CA_FILE optionally supplies the CA bundle.
+    certificate is pinned (a bad pin is a MikException as well); ROOT_CA_FILE
+    optionally supplies the CA bundle.
     """
     req = Request(
         f"{GITHUB_API}{path}",
         headers={"Accept": "application/vnd.github+json", "User-Agent": "mik"},
     )
-    context = make_pinned_ssl_context(GITHUB_COM_CERT_SHA256, cafile=ROOT_CA_FILE) if GITHUB_COM_CERT_SHA256 else None
+    context = None
+    if GITHUB_COM_CERT_SHA256 is not None:
+        pins = configured_pins(GITHUB_COM_CERT_SHA256, "GITHUB_COM_CERT_SHA256")
+        context = make_pinned_ssl_context(pins, cafile=ROOT_CA_FILE)
     try:
         with urlopen(req, timeout=10, context=context) as resp:
             return json.loads(resp.read().decode())

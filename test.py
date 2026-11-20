@@ -10,6 +10,7 @@ import io
 import json
 import os
 import re
+import sys
 import tarfile
 import tempfile
 import unittest
@@ -478,6 +479,58 @@ class PinnedSslTests(unittest.TestCase):
         with mock.patch.object(mik, "GITHUB_COM_CERT_SHA256", None), mock.patch.object(mik, "urlopen", fake_urlopen):
             mik._github_get_json("/repos/o/r")
         self.assertIsNone(captured["context"])
+
+
+class ConfiguredPinsTests(unittest.TestCase):
+    PIN, OTHER = "ab" * 32, "cd" * 32
+
+    def test_one_or_several(self):
+        self.assertEqual(mik.configured_pins(self.PIN.upper()), (self.PIN,))
+        self.assertEqual(mik.configured_pins([self.PIN, self.OTHER.upper()]), (self.PIN, self.OTHER))
+        self.assertEqual(mik.configured_pins((self.PIN,)), (self.PIN,))
+
+    def test_what_a_pin_command_prints(self):
+        out = mik.run_step([sys.executable, "-c", f"print('{self.PIN}'); print('{self.OTHER}')"])
+        self.assertEqual(mik.configured_pins(out.decode().split()), (self.PIN, self.OTHER))
+
+    def test_bad_values_are_refused(self):
+        too_many = [self.PIN] * (mik.PIN_MAX_COUNT + 1)
+        bads = ("", "ab" * 31, "zz" * 32, self.PIN + " ", [], [""], [self.PIN, "nope"], [self.PIN, 1], too_many)
+        for bad in (*bads, [self.PIN.encode()], self.PIN.encode(), 42, {self.PIN: 1}):
+            with self.subTest(bad=bad), self.assertRaises(mik.MikException):
+                mik.configured_pins(bad)
+
+    def test_get_accepts_any_of_several(self):
+        captured = {}
+
+        def fake_urlopen(req, timeout=None, context=None):
+            captured["context"] = context
+            return _FakeResp(b"{}")
+
+        def fake_context(pins, cafile=None):
+            captured["pins"] = pins
+            return "context"
+
+        with (
+            mock.patch.object(mik, "GITHUB_COM_CERT_SHA256", [self.PIN, self.OTHER]),
+            mock.patch.object(mik, "make_pinned_ssl_context", fake_context),
+            mock.patch.object(mik, "urlopen", fake_urlopen),
+        ):
+            mik._github_get_json("/repos/o/r")
+        self.assertEqual(captured, {"pins": (self.PIN, self.OTHER), "context": "context"})
+
+    def test_bad_pin_never_connects(self):
+        for bad in ("", [], ["nope"]):
+            with (
+                self.subTest(bad=bad),
+                mock.patch.object(mik, "GITHUB_COM_CERT_SHA256", bad),
+                mock.patch.object(mik, "urlopen", side_effect=AssertionError("connected")),
+            ):
+                with self.assertRaises(mik.MikException):
+                    mik._github_get_json("/repos/o/r")
+                with self.assertRaises(mik.MikException):
+                    mik.pinned_urlopen("https://x/y", bad)
+                self.assertEqual(mik._fetch_ci_status("p", "o/r")["state"], mik.CI_FETCH_ERROR)
 
 
 class PinnedUrlopenTests(unittest.TestCase):

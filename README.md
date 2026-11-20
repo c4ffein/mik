@@ -93,7 +93,9 @@ artifact store (`build_artifact`, `latest_release`, `resolve_release`,
 ships a directory to the remote as an immutable release and atomically flips the
 `current` symlink the web server serves through, with an optional overlap window
 to smooth hashed-bundle upgrades), and `pinned_urlopen` / `make_pinned_ssl_context`
-for fetching over TLS with optional leaf-cert pinning. Each helper's full
+for fetching over TLS with optional leaf-cert pinning (a pin is a SHA256, or a
+list of them: the config can ask a command for the current ones, such as `tls-pin-get`
+from [crypto](https://github.com/c4ffein/crypto)). Each helper's full
 signature and semantics live in its docstring in `mik.py` (see `__all__` for the
 list; a `mik help <command>` surfacing them is on the TODO list).
 
