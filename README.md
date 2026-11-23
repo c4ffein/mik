@@ -91,8 +91,10 @@ artifact store (`build_artifact`, `latest_release`, `resolve_release`,
 `prune_artifacts`, `artifact_category_dir`), shell runners (`run_step`, `pop`,
 `run_and_capture`, `record_run`), `deploy_release` (zero-downtime static deploy:
 ships a directory to the remote as an immutable release and atomically flips the
-`current` symlink the web server serves through, with an optional overlap window
-to smooth hashed-bundle upgrades), and `pinned_urlopen` / `make_pinned_ssl_context`
+`current` symlink the web server serves through; what it points at is the new
+release merged over those that were live in the last day, so a page loaded
+before the deploy still finds its hashed bundles),
+and `pinned_urlopen` / `make_pinned_ssl_context`
 for fetching over TLS with optional leaf-cert pinning (a pin is a SHA256, or a
 list of them: the config can ask a command for the current ones, such as `tls-pin-get`
 from [crypto](https://github.com/c4ffein/crypto)). Each helper's full

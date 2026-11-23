@@ -665,9 +665,13 @@ def _remote_cmds(rs_mock):
 
 class DeployReleaseTests(unittest.TestCase):
     """deploy_release ships an already-built artifact via scp/ssh as the (unprivileged) ssh user — no sudo.
-    We mock pop (the writability preflight) + run_step + sleep and assert the exact remote command sequence."""
+    We mock pop (the writability preflight) + run_step and assert the exact remote command sequence. The one
+    step whose output matters is the look at the remote site root: `_survey` writes what it would print."""
 
     R = "/var/www/site/releases"
+    M = "/var/www/site/merged"
+    DAY = 86400
+    NOW = 2_000_000
 
     def _src(self, d):
         """A finished artifact dir (what build_artifact would have produced) under tmp dir `d`."""
@@ -677,6 +681,30 @@ class DeployReleaseTests(unittest.TestCase):
         (src / "bundle.YYY.js").write_text("//y")
         return src
 
+    @classmethod
+    def _survey(cls, current, releases, merged=()):
+        """What the remote prints: its clock, where `current` leads, each release with its upload date."""
+        lines = [f"now {cls.NOW}", f"current {current}"]
+        lines += [f"release {cls.NOW - age}.5 {name}" for name, age in releases]
+        lines += [f"merged {name}" for name in merged]
+        return ("\n".join(lines) + "\n").encode()
+
+    def _deploy(self, survey, run_step=None, **kwargs):
+        """deploy_release of release 123 with ssh mocked; returns (pop mock, remote commands, printed lines)."""
+
+        def step(cmda, *a, **k):
+            return survey if "echo now" in " ".join(cmda) else b""
+
+        with tempfile.TemporaryDirectory() as d:
+            src = self._src(d)
+            with (
+                mock.patch.object(mik, "pop", return_value=(0, b"", b"")) as pop,
+                mock.patch.object(mik, "run_step", side_effect=run_step or step) as rs,
+                mock.patch("builtins.print") as p,
+            ):
+                mik.deploy_release(src, "user@host", "/var/www/site", release_id="123", name="site", **kwargs)
+            return pop, _remote_cmds(rs), _printed(p), src
+
     @staticmethod
     def _idx(cmds, sub):
         return next(i for i, c in enumerate(cmds) if sub in c)
@@ -685,76 +713,119 @@ class DeployReleaseTests(unittest.TestCase):
     def _idx_exact(cmds, whole):
         return next(i for i, c in enumerate(cmds) if c == whole)
 
-    def test_overlap_sequence(self):
-        with tempfile.TemporaryDirectory() as d:
-            src = self._src(d)
-            sleep_pos = []
-            with (
-                mock.patch.object(mik, "pop", return_value=(0, b"", b"")) as pop,
-                mock.patch.object(mik, "run_step") as rs,
-                mock.patch.object(mik, "sleep", side_effect=lambda s: sleep_pos.append(rs.call_count)) as slp,
-                mock.patch("builtins.print"),
-            ):
-                mik.deploy_release(
-                    src, "user@host", "/var/www/site", release_id="123", name="site", keep=5, overlap_seconds=30
-                )
+    # Four releases on the remote besides the one being shipped: two from before the last day (only the
+    # newer of them was still live when the day began), one from within it, and 123 itself, just uploaded.
+    HISTORY = [("100", 9 * DAY), ("105", 2 * DAY), ("110", DAY // 2), ("123", 10)]
 
-            pop.assert_called_once()  # writability preflight ran
-            slp.assert_called_once_with(30)  # one wait, the configured window
+    def test_merge_sequence(self):
+        survey = self._survey("merged/110", self.HISTORY, merged=["105", "110"])
+        pop, cmds, printed, src = self._deploy(survey)
 
-            cmds = _remote_cmds(rs)
-            ship_clear = self._idx_exact(cmds, f"ssh user@host rm -rf {self.R}/.mik-STAGING-123")
-            scp = self._idx(cmds, "scp -r")
-            self.assertIn(str(src), cmds[scp])  # ships the artifact dir itself, no local copy
-            self.assertIn(f"user@host:{self.R}/.mik-STAGING-123", cmds[scp])
-            promote = self._idx(cmds, f"mv {self.R}/.mik-STAGING-123 {self.R}/123")
-            # world-readable before the mv, so the release is born readable
-            self.assertIn("chmod -R a+rX", cmds[promote])
-            self.assertLess(cmds[promote].index("chmod"), cmds[promote].index(f"mv {self.R}/.mik-STAGING-123"))
-            overlap_build = self._idx(cmds, "cp -rL /var/www/site/current/.")
-            ov_flip = self._idx(cmds, "ln -sfn releases/.mik-OVERLAP-123")
-            clean_flip = self._idx(cmds, "ln -sfn releases/123")
-            rm_overlap = self._idx_exact(cmds, f"ssh user@host rm -rf {self.R}/.mik-OVERLAP-123")
-            prune = self._idx(cmds, "head -n -5")
+        pop.assert_called_once()  # writability preflight ran
+        ship_clear = self._idx_exact(cmds, f"ssh user@host rm -rf {self.R}/.mik-STAGING-123")
+        scp = self._idx(cmds, "scp -r")
+        self.assertIn(str(src), cmds[scp])  # ships the artifact dir itself, no local copy
+        self.assertIn(f"user@host:{self.R}/.mik-STAGING-123", cmds[scp])
+        promote = self._idx(cmds, f"mv {self.R}/.mik-STAGING-123 {self.R}/123")
+        # world-readable before the mv, so the release is born readable
+        self.assertLess(cmds[promote].index("chmod -R a+rX"), cmds[promote].index(f"mv {self.R}/.mik-STAGING-123"))
+        look = self._idx(cmds, "echo now $(date +%s)")
+        self.assertIn("readlink current", cmds[look])
+        self.assertIn("-printf 'release %T@ %f\\n'", cmds[look])
+        merge = self._idx(cmds, f"mv {self.M}/.mik-MERGING-123 {self.M}/123")
+        flip = self._idx(cmds, "ln -sfn merged/123")
+        cleanup = self._idx(cmds, f"rm -rf {self.M}/105")
 
-            # strict ordering: clear -> ship -> promote -> build union -> flip-to-union -> SLEEP -> flip-to-clean
-            for earlier, later in zip(
-                [ship_clear, scp, promote, overlap_build, ov_flip, clean_flip, rm_overlap],
-                [scp, promote, overlap_build, ov_flip, clean_flip, rm_overlap, prune],
-            ):
-                self.assertLess(earlier, later)
-            # the union is served before the wait, the clean release only after it
-            self.assertLess(ov_flip, sleep_pos[0])
-            self.assertLessEqual(sleep_pos[0], clean_flip)
-            # both flips are an atomic rename over `current`
-            self.assertIn("mv -T", cmds[ov_flip])
-            self.assertIn("mv -T", cmds[clean_flip])
-            # the whole thing runs without sudo (user owns the web root)
-            self.assertFalse(any("sudo" in c for c in cmds))
+        # strict ordering: clear -> ship -> promote -> look -> build the merge -> flip -> delete leftovers
+        for earlier, later in zip(
+            [ship_clear, scp, promote, look, merge, flip], [scp, promote, look, merge, flip, cleanup]
+        ):
+            self.assertLess(earlier, later)
 
-    def test_no_overlap_when_zero_seconds(self):
-        with tempfile.TemporaryDirectory() as d:
-            src = self._src(d)
-            with (
-                mock.patch.object(mik, "pop", return_value=(0, b"", b"")),
-                mock.patch.object(mik, "run_step") as rs,
-                mock.patch.object(mik, "sleep") as slp,
-                mock.patch("builtins.print"),
-            ):
-                mik.deploy_release(src, "user@host", "/var/www/site", release_id="123", name="site", overlap_seconds=0)
-            slp.assert_not_called()
-            cmds = _remote_cmds(rs)
-            # no union built/flipped/torn-down — straight to the clean release
-            self.assertFalse(any("cp -rL /var/www/site/current/." in c for c in cmds))
-            self.assertFalse(any("ln -sfn releases/.mik-OVERLAP-123" in c for c in cmds))
-            self.assertFalse(any(c == f"ssh user@host rm -rf {self.R}/.mik-OVERLAP-123" for c in cmds))
-            self.assertTrue(any("ln -sfn releases/123" in c for c in cmds))
+        # the merge: the release that was live when the day began, then the one from within the day, then the
+        # new one LAST so it wins on shared names. 100 was already replaced before the day began: left out.
+        built = cmds[merge]
+        copies = [built.index(f"cp -rL {self.R}/{name}/. {self.M}/.mik-MERGING-123/") for name in ("105", "110", "123")]
+        self.assertEqual(copies, sorted(copies))
+        self.assertNotIn(f"{self.R}/100/", built)
+        # built under another name, made readable, and only then given its own
+        self.assertLess(copies[-1], built.index("chmod -R a+rX"))
+        self.assertLess(built.index("chmod -R a+rX"), built.index(f"mv {self.M}/.mik-MERGING-123 {self.M}/123"))
+        # the flip is an atomic rename over `current`
+        self.assertIn("mv -T", cmds[flip])
+        # deleted: the merge nobody serves any more. Not the one served until a moment ago (110), and no
+        # release: with keep=5 all four stay.
+        self.assertEqual(cmds[cleanup], f"ssh user@host rm -rf {self.M}/105")
+        # the whole thing runs without sudo (user owns the web root), and without waiting for anything
+        self.assertFalse(any("sudo" in c for c in cmds))
+        self.assertFalse(hasattr(mik, "sleep"))
+        self.assertTrue(any("merged/123" in line and "105, 110" in line for line in printed))
+
+    def test_prune_keeps_what_the_next_merge_needs_and_what_was_being_served(self):
+        # keep=1 asks for the new release alone; 105 and 110 are still needed to merge from, 100 is not
+        survey = self._survey("releases/100", self.HISTORY)
+        _, cmds, _, _ = self._deploy(survey, keep=1)
+        self.assertFalse(any(f"rm -rf {self.R}/1" in c for c in cmds))  # 100 was being served: next time
+        survey = self._survey("merged/110", self.HISTORY, merged=["110"])
+        _, cmds, _, _ = self._deploy(survey, keep=1)
+        self.assertEqual(cmds[-1], f"ssh user@host rm -rf {self.R}/100")
+
+    def test_no_merge_when_zero_seconds(self):
+        survey = self._survey("merged/110", self.HISTORY, merged=["105", "110"])
+        _, cmds, printed, _ = self._deploy(survey, merge_seconds=0, keep=2)
+        # nothing merged — `current` leads straight to the clean release
+        self.assertFalse(any("cp -rL" in c for c in cmds))
+        self.assertFalse(any(".mik-MERGING" in c for c in cmds))
+        self.assertTrue(any("ln -sfn releases/123" in c for c in cmds))
+        # 110 stays as one of the two newest; its merge stays because it was being served until now
+        self.assertEqual(cmds[-1], f"ssh user@host rm -rf {self.R}/100 {self.R}/105 {self.M}/105")
+        self.assertTrue(any(line.endswith("current -> releases/123") for line in printed))
+
+    def test_first_deploy_serves_the_release_alone_under_its_merged_name(self):
+        _, cmds, _, _ = self._deploy(self._survey("", [("123", 5)]))
+        merge = self._idx(cmds, f"mv {self.M}/.mik-MERGING-123 {self.M}/123")
+        self.assertEqual(cmds[merge].count("cp -rL"), 1)
+        self.assertTrue(any("ln -sfn merged/123" in c for c in cmds))
+        self.assertIn("mv -T", cmds[-1])  # the flip is the last thing done: nothing to delete yet
+
+    def test_a_release_shipped_again_is_never_emptied_under_its_name(self):
+        _, cmds, _, _ = self._deploy(self._survey("merged/123", [("110", self.DAY), ("123", 5)], merged=["123"]))
+        for where, incoming in ((self.R, ".mik-STAGING-123"), (self.M, ".mik-MERGING-123")):
+            cmd = cmds[self._idx(cmds, f"mv {where}/{incoming} {where}/123")]
+            aside = cmd.index(f"mv {where}/123 {where}/.mik-OLD-123")
+            arrive = cmd.index(f"mv {where}/{incoming} {where}/123")
+            self.assertLess(aside, arrive)  # renamed aside, then replaced by a rename
+            self.assertLess(arrive, cmd.rindex(f"rm -rf {where}/.mik-OLD-123"))  # and only then deleted
+            self.assertNotIn(f"rm -rf {where}/123", cmd)
+
+    def test_releases_to_merge(self):
+        pick = lambda releases, seconds=self.DAY: mik._releases_to_merge(  # noqa: E731
+            [(self.NOW - age, name) for name, age in releases], "123", self.NOW, seconds
+        )
+        self.assertEqual(pick([("123", 5)]), [])  # first deploy
+        self.assertEqual(pick(self.HISTORY), ["105", "110"])
+        # nothing went live in the last day: what was live all along is still what open tabs hold
+        self.assertEqual(pick([("100", 9 * self.DAY), ("105", 2 * self.DAY), ("123", 5)]), ["105"])
+        # everything went live within the day: all of it, oldest first, whatever order it is listed in
+        self.assertEqual(pick([("110", 100), ("123", 5), ("105", 200)]), ["105", "110"])
+        # the release being shipped is never merged under itself, even if an older copy of it is listed
+        self.assertEqual(pick([("123", 3 * self.DAY), ("110", 100)]), ["110"])
+        self.assertEqual(pick(self.HISTORY, seconds=0), [])
+
+    def test_survey_only_sees_what_is_safe_to_name_in_a_remote_command(self):
+        out = (
+            b"now 2000000\ncurrent merged/110\n"
+            b"release 1999000.25 110\nrelease 1990000.0 backup-old\nrelease soon 111\nrelease 1.0 a b\n"
+            b"merged 110\nmerged .mik-OLD-110\nmerged x;rm\nsomething else\n"
+        )
+        self.assertEqual(mik._parse_site_survey(out), (2000000, "merged/110", [(1999000.25, "110")], ["110"]))
+        with self.assertRaises(mik.MikException):
+            mik._parse_site_survey(b"current merged/110\n")  # no clock: the remote command did not run
 
     def test_unwritable_site_root_raises_before_side_effects(self):
         with (
             mock.patch.object(mik, "pop", return_value=(1, b"Permission denied", b"")),
             mock.patch.object(mik, "run_step") as rs,
-            mock.patch.object(mik, "sleep"),
         ):
             with self.assertRaises(mik.MikException) as cm:
                 mik.deploy_release("/tmp/x", "user@host", "/var/www/site", release_id="123", name="site")
@@ -765,7 +836,8 @@ class DeployReleaseTests(unittest.TestCase):
         bad = [
             dict(release_id="1 2"),  # space -> not alnum
             dict(release_id="a/b"),  # slash -> not alnum
-            dict(keep=0),  # head -n -0 would wipe the live release
+            dict(keep=0),  # the new release counts: keeping none would delete what is live
+            dict(merge_seconds=-1),
             dict(site_root="relative/path"),  # not absolute
             dict(site_root="/a/../b"),  # traversal
             dict(ssh_host="a b@host"),  # space in ssh user
@@ -781,7 +853,6 @@ class DeployReleaseTests(unittest.TestCase):
             with (
                 mock.patch.object(mik, "pop") as pop,
                 mock.patch.object(mik, "run_step") as rs,
-                mock.patch.object(mik, "sleep"),
             ):
                 with self.assertRaises(mik.MikException, msg=override):
                     mik.deploy_release(**{**base, **override})
@@ -796,7 +867,6 @@ class DeployReleaseTests(unittest.TestCase):
             with (
                 mock.patch.object(mik, "pop") as pop,
                 mock.patch.object(mik, "run_step") as rs,
-                mock.patch.object(mik, "sleep"),
             ):
                 with self.assertRaises(mik.MikException) as cm:
                     mik.deploy_release(src, "user@host", "/var/www/site", release_id="123", name="site")
@@ -805,22 +875,15 @@ class DeployReleaseTests(unittest.TestCase):
             rs.assert_not_called()
 
     def test_prune_failure_does_not_fail_deploy(self):
-        with tempfile.TemporaryDirectory() as d:
-            src = self._src(d)
+        survey = self._survey("merged/110", self.HISTORY, merged=["105", "110"])
 
-            def boom_on_prune(cmda, *a, **k):
-                if any("head -n" in str(x) for x in cmda):
-                    raise mik.MikException("prune blew up")
-                return b""
+        def boom_on_prune(cmda, *a, **k):
+            if f"rm -rf {self.M}/105" in " ".join(cmda):
+                raise mik.MikException("prune blew up")
+            return survey if "echo now" in " ".join(cmda) else b""
 
-            with (
-                mock.patch.object(mik, "pop", return_value=(0, b"", b"")),
-                mock.patch.object(mik, "run_step", side_effect=boom_on_prune),
-                mock.patch.object(mik, "sleep"),
-                mock.patch("builtins.print") as p,
-            ):
-                mik.deploy_release(src, "user@host", "/var/www/site", release_id="123", name="site", overlap_seconds=0)
-            self.assertTrue(any("deployed site" in line for line in _printed(p)))
+        _, _, printed, _ = self._deploy(survey, run_step=boom_on_prune)
+        self.assertTrue(any("deployed site" in line for line in printed))
 
 
 class ReadmeSyncTests(unittest.TestCase):

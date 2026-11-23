@@ -15,7 +15,6 @@ import traceback
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from enum import Enum
-from time import sleep
 from hashlib import sha256
 from ssl import (
     CERT_NONE,
@@ -720,49 +719,120 @@ def _flip_current(ssh_host, site_root, target):
     run_step(["ssh", ssh_host, f"ln -sfn {target} {tmp} && mv -T {tmp} {site_root}/current"])
 
 
-def deploy_release(src, ssh_host, site_root, release_id, name, keep=5, overlap_seconds=30):
+def _parse_site_survey(out):
+    """What a remote look at {site_root} found: (now, current_target, [(mtime, release)], [merged]).
+
+    One tagged line per fact, as _survey_site prints them. Names are interpolated into later remote
+    commands (cp, rm -rf), so anything that is not plain alnum — a directory somebody made by hand — is
+    simply not seen: never merged, never deleted.
+    """
+    now, current, releases, merged = None, "", [], []
+    for line in out.decode(errors="replace").splitlines():
+        tag, _, rest = line.partition(" ")
+        rest = rest.strip()
+        if tag == "now" and rest.isdigit():
+            now = int(rest)
+        elif tag == "current":
+            current = rest
+        elif tag == "release":
+            stamp, _, entry = rest.partition(" ")
+            try:
+                when = float(stamp)
+            except ValueError:
+                continue
+            if entry.isalnum():
+                releases.append((when, entry))
+        elif tag == "merged" and rest.isalnum():
+            merged.append(rest)
+    if now is None:
+        raise MikException(f"could not read the state of the remote site root:\n{out.decode(errors='replace')}")
+    return now, current, sorted(releases), merged
+
+
+def _releases_to_merge(releases, rid, now, merge_seconds):
+    """The earlier releases whose files stay available under the new one, oldest first.
+
+    `releases` is [(mtime, name)]: a release directory's own date is when it was uploaded, so when it
+    went live. A page that is open in somebody's browser was loaded from whatever was live at the time:
+    so a tab up to merge_seconds old may hold any release that went live within that time, or the one
+    that already was live when that time began — the newest of those from before. Nothing older.
+    """
+    if merge_seconds <= 0:
+        return []
+    others = [(when, entry) for when, entry in sorted(releases) if entry != rid]
+    cut = now - merge_seconds
+    before = [entry for when, entry in others if when < cut]
+    within = [entry for when, entry in others if when >= cut]
+    return before[-1:] + within
+
+
+def _site_leftovers(releases, merged, rid, serving, merging, keep):
+    """(releases, merged dirs) that nothing needs any more, once `rid` is live.
+
+    Kept: the new release, the `keep` newest, whatever the next deploy may still have to merge (`merging`
+    is what this one merged: the next one's window is a subset of it plus the new release), and — under
+    either name — what was being served until a moment ago (`serving`, the old target of `current`). A
+    server that follows `current` on a timer rather than per request is still reading from that directory
+    for a few seconds after the flip, so it goes at the next deploy, not at this one.
+    """
+    newest = [entry for _, entry in sorted(releases) if entry != rid][-max(int(keep) - 1, 0) :] if keep > 1 else []
+    was_dir, _, was = serving.partition("/")
+    keep_releases = {rid, *merging, *newest} | ({was} if was_dir == "releases" else set())
+    keep_merged = {rid} | ({was} if was_dir == "merged" else set())
+    return (
+        [entry for _, entry in sorted(releases) if entry not in keep_releases],
+        [entry for entry in sorted(merged) if entry not in keep_merged],
+    )
+
+
+def deploy_release(src, ssh_host, site_root, release_id, name, keep=5, merge_seconds=86400):
     """Atomic zero-downtime deploy of an already-built artifact. No rsync, no shell pipes, no sudo.
 
     Config helper — the *deploy* half of build/deploy. `src` is a finished artifact directory (typically
     from latest_release()/resolve_release()); choosing, excluding and transforming files is the *build*
     step's job (see build_artifact), so this ships src as-is. It scp's src into {site_root}/releases/{id},
-    makes it world-readable, then flips the `current` symlink the web server serves through — picked up on
-    the next request, no reload. Fresh dir per release => no stale files; the artifact we serve long-term
-    is always one pristine release.
+    makes it world-readable, then flips the `current` symlink the web server serves through. Nothing is
+    ever changed in a directory that is being served: every step builds a new one beside it, and the flip
+    is a rename.
 
     Runs entirely as the ssh user — *no sudo*. The web root must be owned/writable by that user (a one-time
     `chown -R <user> {site_root}`); a preflight check fails fast with that instruction if it isn't. A
     containerized web server serving from a bind mount reads files by their world-readable ("other") bits
-    regardless of host ownership, which is why each release is `chmod -R a+rX`'d before it's served.
+    regardless of host ownership, which is why everything is `chmod -R a+rX`'d before it's served.
 
-    When overlap_seconds > 0, `current` is first flipped for that many seconds to a *transient union* of
-    the previous release and the new one (new winning on shared names like index.html), then flipped to
-    the clean new release. This covers the race where a browser fetched the old index.html moments before
-    the deploy and then requests an old hashed bundle the clean release no longer has: during the window
-    both old and new hashed assets are served while index.html is already the new one. The union is never
-    served long-term — so every served-forever release is still a single, individually-built artifact.
+    What is served. With merge_seconds > 0 (a day by default), `current` does not point at the release
+    itself but at {site_root}/merged/{id}: the releases that went live in the last merge_seconds, plus the
+    one that was live before that, copied over one another from oldest to newest, the new release last (so
+    it wins on every name they share, index.html first of all). {site_root}/releases/{id} stays the
+    pristine build: the next deploy merges from those, never from a merge, so a file leaves when its
+    release leaves the window. With merge_seconds=0, `current` points at the clean release.
 
-    What the overlap actually covers (i.e. when this helper is sufficient on its own). A 404 only happens
-    when a browser holds an OLD index.html and then requests an OLD bundle the now-current release dropped.
-    Two cases, given index.html is served `Cache-Control: no-cache` (else the browser reuses a hard-cached
-    old index and nothing server-side can help):
-      - Eager bundles (no code-splitting — the common static-site case): the only exposure is a tab caught
-        *mid-initial-load* when the flip lands, a seconds-wide race (a frozen, fully-loaded tab already has
-        its bundles and is safe). overlap_seconds=30 comfortably contains that race => SUFFICIENT, this is
-        effectively zero-downtime on its own.
-      - Lazy / code-split chunks (`import()` on navigation, React.lazy): a tab can sit open for hours, then
-        request an old chunk for the first time. The window is unbounded => this overlap is only PARTIAL;
-        the tail needs a client-side reload-on-ChunkLoadError / vite:preloadError handler, which then owns
-        correctness and makes the overlap mere polish.
+    Why merge. A browser that loaded index.html before the deploy still asks for the hashed bundles that
+    page names, and a clean new release no longer has them: a 404, a broken tab. Under the merge, a tab up
+    to merge_seconds old finds every bundle it can ask for. What that does not cover: a tab left open for
+    longer, then asking for a lazy chunk for the first time. That tail needs the application to reload on
+    a failed chunk load (once, not in a loop); the merge makes it rare, the handler makes it correct. Both
+    rely on index.html being served `Cache-Control: no-cache`.
 
-    Inputs land in a remote shell and in paths, so they're validated up front. Needs GNU head/xargs on
-    the remote (Debian has both).
+    What it costs. A file removed from a build keeps being served until the first deploy made more than
+    merge_seconds after the one that removed it — the merge is only made when deploying. For a bundle
+    nobody asks for, nothing; for a page that had to disappear, deploy with merge_seconds=0.
+
+    What is deleted, and when. Releases beyond the `keep` newest, unless a later merge may still need
+    them; merged directories other than the new one. Never, in the same deploy, the directory that was
+    being served until the flip: a server that looks at where `current` leads every few seconds, rather
+    than on every request, is still reading from it for that long. It goes at the next deploy.
+
+    Inputs land in a remote shell and in paths, so they're validated up front. Needs GNU find on the
+    remote (Debian has it).
     """
     rid = str(release_id)
     if not rid.isalnum():  # lands in a remote shell + a path — keep it boring
         raise MikException(f"unsafe release_id: {rid!r}")
-    if int(keep) < 1:  # keep=0 => GNU `head -n -0` prints every line => prune would delete the live release
+    if int(keep) < 1:  # the new release itself counts: keeping none of them would delete what is live
         raise MikException("keep must be >= 1")
+    if int(merge_seconds) < 0:
+        raise MikException("merge_seconds must be >= 0 (0 serves the release alone)")
     validate_code_dir(site_root)  # absolute, no '..', boring chars — it's interpolated into a remote target
     for part in ssh_host.split("@"):
         try:
@@ -771,15 +841,15 @@ def deploy_release(src, ssh_host, site_root, release_id, name, keep=5, overlap_s
             raise MikException(f"unsafe ssh_host: {ssh_host!r}") from exc
     _assert_artifact_has_no_links(src)  # payload check, before any remote contact: scp -r/cp -rL deref links
     # Invariant from here on: rid is alnum and site_root is a clean absolute path, so every remote string
-    # composed below ({site_root}/releases/{rid}, .mik-STAGING-{rid}, .mik-OVERLAP-{rid}, ...) is shell-safe
-    # by construction. That's why the sinks below — including _flip_current — interpolate without re-checking.
+    # composed below ({site_root}/releases/{rid}, .mik-STAGING-{rid}, merged/{rid}, ...) is shell-safe by
+    # construction, and so is every other release name: _parse_site_survey only lets alnum ones through.
+    # That's why the sinks below — including _flip_current — interpolate without re-checking.
     # (`name` is a log label only — it no longer reaches a shell or a path — so it needs no validation.)
-    releases_dir = f"{site_root}/releases"  # holds every release for this instance, plus current's targets
-    new_release_dir = f"{releases_dir}/{rid}"  # the immutable release we ultimately serve
-    new_release_rel = f"releases/{rid}"  # same dir, relative to site_root — the symlink target
-    staging_dir = f"{releases_dir}/.mik-STAGING-{rid}"  # transient upload target (dotfile: ignored by prune)
-    overlap_dir = f"{releases_dir}/.mik-OVERLAP-{rid}"  # transient previous-∪-new union (dotfile: ignored by prune)
-    overlap_rel = f"releases/.mik-OVERLAP-{rid}"  # the union dir, relative to site_root — the symlink target
+    releases_dir = f"{site_root}/releases"  # every release for this instance, pristine, as uploaded
+    merged_root = f"{site_root}/merged"  # what `current` leads to when releases are merged
+    new_release_dir = f"{releases_dir}/{rid}"
+    staging_dir = f"{releases_dir}/.mik-STAGING-{rid}"  # transient upload target (dotfile: never listed)
+    merged_dir = f"{merged_root}/{rid}"
     # 0. preflight: make releases/ and confirm it's writable AS THE SSH USER, so we fail with an actionable
     #    message instead of a cryptic scp/rm permission error mid-deploy. Everything below runs without sudo.
     rc, err, _ = pop(["ssh", ssh_host, f"mkdir -p {releases_dir} && test -w {releases_dir}"])
@@ -792,8 +862,10 @@ def deploy_release(src, ssh_host, site_root, release_id, name, keep=5, overlap_s
     run_step(["ssh", ssh_host, f"rm -rf {staging_dir}"])
     run_step(["scp", "-r", str(src), f"{ssh_host}:{staging_dir}"])
     # 2. make the upload world-readable (a containerized server reads by 'other' bits), then promote it to a
-    #    fresh immutable release dir — same filesystem, so the mv is an atomic rename. `a+rX` before the mv
-    #    means the release is born readable: `current` never points at a not-yet-chmod'd dir.
+    #    fresh immutable release dir — same filesystem, so the mv is an atomic rename. If this rid is there
+    #    already (shipped again, perhaps while it is live), the old copy is renamed aside first and deleted
+    #    after: a directory is never emptied under its name.
+    aside = f"{releases_dir}/.mik-OLD-{rid}"
     run_step(
         [
             "ssh",
@@ -801,44 +873,73 @@ def deploy_release(src, ssh_host, site_root, release_id, name, keep=5, overlap_s
             " && ".join(
                 [
                     f"chmod -R a+rX {staging_dir}",
-                    f"rm -rf {new_release_dir} {overlap_dir}",  # clear leftovers from a crashed run of this rid
+                    f"rm -rf {aside}",
+                    f"(mv {new_release_dir} {aside} 2>/dev/null || true)",
                     f"mv {staging_dir} {new_release_dir}",
+                    f"rm -rf {aside}",
                 ]
             ),
         ]
     )
-    # 3. optional transient overlap: serve (previous ∪ new, new winning) — see the docstring for what this
-    #    window does and doesn't cover. `current` still points at the previous release here, so `current/.`
-    #    seeds the union with the old files; first deploy => the `|| true` leaves it empty and the union is
-    #    just the new release (the sleep is then a harmless no-op).
-    if overlap_seconds and overlap_seconds > 0:
+    # 3. look at what is there: the remote clock, where `current` leads, each release with the date it was
+    #    uploaded (its directory's own), the merged directories. Read-only; choosing happens here, in Python.
+    survey = run_step(
+        [
+            "ssh",
+            ssh_host,
+            " && ".join(
+                [
+                    f"cd {site_root}",
+                    "echo now $(date +%s)",
+                    "echo current $(readlink current 2>/dev/null)",
+                    "find releases -mindepth 1 -maxdepth 1 -type d ! -name '.*' -printf 'release %T@ %f\\n'",
+                    "(find merged -mindepth 1 -maxdepth 1 -type d -printf 'merged %f\\n' 2>/dev/null || true)",
+                ]
+            ),
+        ]
+    )
+    now, serving, releases, merged = _parse_site_survey(survey)
+    merging = _releases_to_merge(releases, rid, now, int(merge_seconds))
+    # 4. what `current` will lead to. Merged: a new directory, the earlier releases copied in from oldest to
+    #    newest and this one last, so that it wins on shared names. Built whole under another name, made
+    #    readable, and only then given its own; an earlier merge of this rid goes aside first, as in 2.
+    if int(merge_seconds) > 0:
+        building = f"{merged_root}/.mik-MERGING-{rid}"
+        aside = f"{merged_root}/.mik-OLD-{rid}"
         run_step(
             [
                 "ssh",
                 ssh_host,
                 " && ".join(
                     [
-                        f"mkdir -p {overlap_dir}",
-                        f"cp -rL {site_root}/current/. {overlap_dir}/ 2>/dev/null || true",
-                        f"cp -rL {new_release_dir}/. {overlap_dir}/",  # merge new in — new wins on shared names
-                        f"chmod -R a+rX {overlap_dir}",
+                        f"rm -rf {building}",
+                        f"mkdir -p {building}",
+                        *[f"cp -rL {releases_dir}/{entry}/. {building}/" for entry in merging],
+                        f"cp -rL {new_release_dir}/. {building}/",
+                        f"chmod -R a+rX {building}",
+                        f"rm -rf {aside}",
+                        f"(mv {merged_dir} {aside} 2>/dev/null || true)",
+                        f"mv {building} {merged_dir}",
+                        f"rm -rf {aside}",
                     ]
                 ),
             ]
         )
-        _flip_current(ssh_host, site_root, overlap_rel)
-        sleep(overlap_seconds)
-    # 4. flip `current` to the clean release (atomic rename, never absent), then drop the overlap dir
-    _flip_current(ssh_host, site_root, new_release_rel)
-    if overlap_seconds and overlap_seconds > 0:
-        run_step(["ssh", ssh_host, f"rm -rf {overlap_dir}"])
-    # 5. prune old releases (best-effort; failure here must not fail the deploy)
-    prune = f"cd {releases_dir} && ls -1 | sort -n | head -n -{int(keep)} | xargs -r -I REPLACE rm -rf REPLACE"
-    try:
-        run_step(["ssh", ssh_host, prune])
-    except MikException as exc:
-        debug(f"prune failed (ignored): {exc}")
-    print(f"deployed {name} -> {site_root}/current (release {rid})")
+        target = f"merged/{rid}"
+    else:
+        target = f"releases/{rid}"
+    # 5. flip `current` (atomic rename, never absent)
+    _flip_current(ssh_host, site_root, target)
+    # 6. delete what nothing needs any more — never what was being served until a moment ago (best-effort;
+    #    failure here must not fail the deploy)
+    old_releases, old_merged = _site_leftovers(releases, merged, rid, serving, merging, int(keep))
+    doomed = [f"{releases_dir}/{entry}" for entry in old_releases] + [f"{merged_root}/{entry}" for entry in old_merged]
+    if doomed:
+        try:
+            run_step(["ssh", ssh_host, "rm -rf " + " ".join(doomed)])
+        except MikException as exc:
+            debug(f"prune failed (ignored): {exc}")
+    print(f"deployed {name} -> {site_root}/current -> {target}" + (f" (over {', '.join(merging)})" if merging else ""))
 
 
 # This is the validation logic inlined as a string for remote scripts (no re, no imports beyond builtins)
