@@ -1,10 +1,41 @@
 [project]
 name = "mik"
 version = "0.0.4"
+description = "KISS project and server management"
+readme = "README.md"
 requires-python = ">=3.11"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [
+  { name = "c4ffein", email = "c4ffein@gmail.com" },
+]
+classifiers = [
+    "Development Status :: 2 - Pre-Alpha",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Intended Audience :: System Administrators",
+    "Operating System :: POSIX",
+    "Programming Language :: Python :: 3",
+    "Topic :: Utilities",
+]
+
+[project.urls]
+Homepage = "https://github.com/c4ffein/mik"
+
+# The installed `mik` command is mik.py itself: one module, one entry point.
+[project.scripts]
+mik = "mik:cli"
+
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+py-modules = ["mik"]
 
 [tool.uv]
-# mik ships via setup.py (scripts/mik); uv is only used here to manage the dev env, not to build it.
+# The dev env (ruff, tests) does not need mik installed in it: the tests import mik.py from the checkout.
+# `uv build` still builds the sdist + wheel from the [build-system] above.
 package = false
 
 [tool.ruff]

@@ -1,5 +1,5 @@
 # MIK
-KISS 1 command deploy
+KISS project and server management
 
 <p align="center">
   <a href="https://pypi.org/project/mik/" alt="PyPI">
@@ -26,7 +26,8 @@ Read the source before pointing it at anything you care about. (Your config is
 mik loads `~/.config/mik/config.py`. It's a **Python** file: mik defines the
 base `Machine`, `Instance` and `Project` classes first, then runs your config,
 so you just subclass them. **Defining a subclass registers it** — there's no
-list to maintain.
+list to maintain (two machines, projects or instances with the same name is an
+error).
 
 The data model is three classes linked by name (the instance carries the
 foreign keys; there is no join table):

@@ -15,6 +15,7 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import tomllib
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -407,6 +408,86 @@ class DevFetchPodTests(unittest.TestCase):
             ):
                 mik.dev_fetch_pod(SimpleNamespace(instance="inst"))
             self.assertEqual((Path(d) / "a.txt").read_bytes(), b"hello")
+
+    def test_refuses_a_file_list_that_leaves_the_repo(self):
+        # The pod is the one not trusted: whatever it lists is checked here, before the question is asked.
+        for entry in (
+            {"path": "../outside.txt", "status": "M"},
+            {"path": "/etc/outside.txt", "status": "M"},
+            {"path": ".git/hooks/pre-commit", "status": "A"},
+            {"path": "a\033[2K.txt", "status": "M"},  # an escape sequence, to rewrite what is shown
+            {"path": "a.txt", "status": "\033[2K"},
+            {"path": "a.txt"},
+            {"path": ["a.txt"], "status": "M"},
+            "a.txt",
+        ):
+            with self.subTest(entry=entry), tempfile.TemporaryDirectory() as d:
+                repo = Path(d) / "repo"
+                repo.mkdir()
+                self._setup(str(repo))
+                list_resp = json.dumps({"files": [{"path": "ok.txt", "status": "M"}, entry], "errors": []}).encode()
+                asked = mock.Mock(side_effect=AssertionError("asked a question"))
+                with (
+                    mock.patch.object(mik, "_run_remote_script", side_effect=[(0, b"", list_resp)]) as remote,
+                    mock.patch("builtins.input", asked),
+                    mock.patch("builtins.print"),
+                ):
+                    with self.assertRaises(mik.MikException):
+                        mik.dev_fetch_pod(SimpleNamespace(instance="inst"))
+                self.assertEqual(remote.call_count, 1)  # never got to the fetch
+                self.assertEqual(list(Path(d).rglob("*")), [repo])  # nothing written, inside or outside
+
+    def test_remote_warnings_cannot_carry_escape_sequences(self):
+        list_resp = json.dumps({"files": [], "errors": ["invalid path: a\033[2Kb"]}).encode()
+        with tempfile.TemporaryDirectory() as d:
+            self._setup(d)
+            with (
+                mock.patch.object(mik, "_run_remote_script", side_effect=[(0, b"", list_resp)]),
+                mock.patch("builtins.print") as printed,
+            ):
+                mik.dev_fetch_pod(SimpleNamespace(instance="inst"))
+        self.assertIn("\033[90m  warning: invalid path: a[2Kb\033[39m", [c.args[0] for c in printed.call_args_list])
+
+
+class DuplicateNameTests(unittest.TestCase):
+    """Defining a subclass registers it under its name: a second one with that name must not replace it."""
+
+    def setUp(self):
+        for registry in (mik.machines_dict, mik.projects_dict, mik.instances_dict):
+            registry.clear()
+            self.addCleanup(registry.clear)
+
+    def test_duplicate_is_refused_naming_both_classes(self):
+        for base, kind, fields in (
+            (mik.Machine, "machine", {"name": "x", "ssh_host": "user@host"}),
+            (mik.Project, "project", {"name": "x"}),
+            (mik.Instance, "instance", {"name": "x"}),
+        ):
+            with self.subTest(kind=kind):
+                first = type("First", (base,), dict(fields))
+                with self.assertRaises(mik.MikException) as ctx:
+                    type("Second", (base,), dict(fields))
+                self.assertEqual(str(ctx.exception), f"Duplicate {kind} name 'x': classes First and Second")
+                registry = {"machine": mik.machines_dict, "project": mik.projects_dict, "instance": mik.instances_dict}
+                self.assertIs(registry[kind]["x"], first)  # the first one is still the one registered
+
+    def test_same_name_across_kinds_is_fine(self):
+        type("M", (mik.Machine,), {"name": "x", "ssh_host": "user@host"})
+        type("P", (mik.Project,), {"name": "x"})
+        type("I", (mik.Instance,), {"name": "x"})
+
+    def test_load_config_reports_it_as_is(self):
+        # No traceback, no generic "Something wrong in the config file": the message itself gets out.
+        config = 'class DupTestOne(Instance):\n    name = "x"\n\n\nclass DupTestTwo(Instance):\n    name = "x"\n'
+        self.addCleanup(lambda: [vars(mik).pop(n, None) for n in ("DupTestOne", "DupTestTwo")])
+        with tempfile.TemporaryDirectory() as d:
+            (Path(d) / "config.py").write_text(config)
+            with mock.patch.object(mik, "CONFIG_FILE", Path(d) / "config.py"):
+                with contextlib.redirect_stderr(io.StringIO()) as err:
+                    with self.assertRaises(mik.MikException) as ctx:
+                        mik.load_config()
+        self.assertEqual(str(ctx.exception), "Duplicate instance name 'x': classes DupTestOne and DupTestTwo")
+        self.assertEqual(err.getvalue(), "")
 
 
 def fake_github(responses):
@@ -1122,6 +1203,66 @@ class DeployReleaseOnDiskTests(unittest.TestCase):
         self.assertIn("backup-old", str(cm.exception))
         self.assertEqual(self._served(), {"index.html": "one"})
         self.assertEqual(self._there("releasing"), [])  # stopped before the upload
+
+
+class FilterParamTests(unittest.TestCase):
+    """The `key=NAME` filters of the list-* commands, through main(): a bad one is a usage error."""
+
+    def setUp(self):
+        for registry in (mik.machines_dict, mik.projects_dict, mik.instances_dict):
+            registry.clear()
+            self.addCleanup(registry.clear)
+        mik.machines_dict["prod"] = SimpleNamespace(name="prod", ssh_host="user@host")
+        mik.projects_dict.update({"app": SimpleNamespace(name="app"), "site": SimpleNamespace(name="site")})
+        mik.instances_dict["app-prod"] = _inst("app-prod", project="app", machine="prod")
+        mik.instances_dict["site-prod"] = _inst("site-prod", project="site", machine="prod")
+
+    def test_bad_filter_is_a_usage_error(self):
+        for argv, expected in (
+            (["list-instances", "foo"], "expected project=NAME or machine=NAME, got 'foo'"),  # no "="
+            (["list-instances", "color=red"], "expected project=NAME or machine=NAME, got 'color=red'"),
+            (["list-instances", "project="], "expected project=NAME or machine=NAME, got 'project='"),
+            (["list-machines", "machine=prod"], "expected project=NAME, got 'machine=prod'"),
+            (["list-projects", "app"], "expected machine=NAME, got 'app'"),
+        ):
+            with self.subTest(argv=argv), mock.patch.object(mik, "load_config") as load_config:
+                with contextlib.redirect_stderr(io.StringIO()) as err:
+                    with self.assertRaises(SystemExit) as ctx:
+                        mik.main(argv)
+                self.assertEqual(ctx.exception.code, 2)
+                self.assertIn(f"error: {expected}", err.getvalue())
+                self.assertNotIn("Traceback", err.getvalue())
+                load_config.assert_not_called()  # refused while parsing: the config is not even read
+
+    def test_good_filter_still_filters(self):
+        with mock.patch.object(mik, "load_config"), mock.patch("builtins.print") as printed:
+            mik.main(["list-instances", "project=app", "machine=prod"])
+        self.assertEqual(_printed(printed), ["app-prod"])
+
+
+class CliTests(unittest.TestCase):
+    """cli() is what the installed `mik` command runs: main(), with expected errors turned into exit codes."""
+
+    def test_returns_what_main_returns(self):
+        with mock.patch.object(mik, "main", return_value=7):
+            self.assertEqual(mik.cli(), 7)
+
+    def test_mik_exception_is_one_line_and_exit_1(self):
+        with mock.patch.object(mik, "main", side_effect=mik.MikException("nope")):
+            with mock.patch("builtins.print") as printed:
+                self.assertEqual(mik.cli(), 1)
+        self.assertEqual(_printed(printed), ["\n  !!  nope  !!  \n"])
+
+    def test_keyboard_interrupt_is_exit_130(self):
+        with mock.patch.object(mik, "main", side_effect=KeyboardInterrupt), mock.patch("builtins.print"):
+            self.assertEqual(mik.cli(), 130)
+
+    def test_pyproject_points_the_command_at_it(self):
+        # The entry point is a string in pyproject.toml: nothing else would notice if cli() were renamed.
+        project = tomllib.loads((Path(__file__).parent / "pyproject.toml").read_text())
+        self.assertEqual(project["project"]["scripts"], {"mik": "mik:cli"})
+        self.assertEqual(project["tool"]["setuptools"]["py-modules"], ["mik"])
+        self.assertTrue(callable(mik.cli))
 
 
 class ReadmeSyncTests(unittest.TestCase):

@@ -36,7 +36,8 @@ from urllib.request import Request, urlopen
 from uuid import uuid4
 
 
-# WARNING: this is quick and dirty, please don't judge current code quality
+# I wanted my own system. It started quick and dirty, and is now of good-enough quality, with Claude's help.
+# It is a single file that you can read: no need to trust the sources of a complex toolset.
 
 
 # Your ~/.config/mik/config.py is exec'd into this module's namespace (see load_config), so every name
@@ -99,6 +100,15 @@ class MikException(Exception):
     pass
 
 
+def _register(registry, kind, name, cls):
+    """Record a config class under its name. Two classes with one name is a mistake in the config: the
+    second would replace the first without a word, so it is refused, naming both.
+    """
+    if name in registry:
+        raise MikException(f"Duplicate {kind} name {name!r}: classes {registry[name].__name__} and {cls.__name__}")
+    registry[name] = cls
+
+
 machines_dict = {}
 
 
@@ -109,7 +119,7 @@ class MachineMeta(type):
         if not namespace.get("name") or not namespace.get("ssh_host"):
             raise MikException(f"Machine {name} needs a name and an ssh_host")
         r = super().__new__(mcs, name, bases, namespace)
-        machines_dict[namespace["name"]] = r
+        _register(machines_dict, "machine", namespace["name"], r)
         return r
 
 
@@ -130,7 +140,7 @@ class InstanceMeta(type):
         if not namespace.get("name"):
             raise MikException(f"Instance {name} needs a name")
         r = super().__new__(mcs, name, bases, namespace)
-        instances_dict[namespace["name"]] = r
+        _register(instances_dict, "instance", namespace["name"], r)
         return r
 
 
@@ -158,7 +168,7 @@ class ProjectMeta(type):
         if not namespace.get("name"):
             raise MikException(f"No name for {name}")
         r = super().__new__(mcs, name, bases, namespace)
-        projects_dict[namespace["name"]] = r
+        _register(projects_dict, "project", namespace["name"], r)
         return r
 
 
@@ -974,7 +984,9 @@ def deploy_release(src, ssh_host, site_root, release_id, name, keep=5, merge_sec
     print(f"deployed {name} -> {site_root}/current -> {target}" + (f" (over {', '.join(merging)})" if merging else ""))
 
 
-# This is the validation logic inlined as a string for remote scripts (no re, no imports beyond builtins)
+# validate_path again, as source text: the listing script runs inside the pod, where mik.py is not there to
+# import (no re, no imports beyond builtins). It only lets an honest pod skip odd names with a warning; what
+# protects the local repo is validate_path itself, run here on whatever comes back (_checked_remote_files).
 _REMOTE_VALIDATE_PATH = """
 _vpo = (
     *range(ord("A"), ord("Z") + 1), *range(ord("a"), ord("z") + 1),
@@ -1069,6 +1081,27 @@ print(base64.b64encode(json.dumps(result).encode()).decode())
 """
 
 
+def _printable(s):
+    """What a pod sent, made safe to print: no escape sequence gets to rewrite what is on the terminal."""
+    return "".join(c for c in str(s) if c.isprintable())
+
+
+def _checked_remote_files(files):
+    """The file list a pod sent, refused as a whole unless every entry is a plain path inside the repo.
+
+    The pod runs the same check on its side (_REMOTE_VALIDATE_PATH), but only to skip odd names with a
+    warning: the pod is the one that is not trusted, and it can answer whatever it likes. So the check that
+    counts is this one, made here, before the list is shown and long before anything is written.
+    """
+    if not isinstance(files, list):
+        raise MikException(f"{Color.RED.value}Bad file list from remote{Color.WHITE.value}")
+    for f in files:
+        ok = isinstance(f, dict) and f.get("status") in ("M", "A", "D") and isinstance(f.get("path"), str)
+        if not ok or not validate_path(f["path"]):
+            raise MikException(f"{Color.RED.value}Refusing the remote file list, bad entry: {f!r}{Color.WHITE.value}")
+    return files
+
+
 def _run_remote_script(ssh_host, container, script):
     encoded = base64.b64encode(script.encode()).decode()
     c, e, r = pop(
@@ -1107,12 +1140,13 @@ def dev_fetch_pod(args):
         raise MikException(f"{Color.RED.value}SSH failed: {e.decode()}{Color.WHITE.value}")
     try:
         data = json.loads(r.decode())
-    except json.JSONDecodeError:
+    except ValueError:  # not JSON, or not UTF-8
+        data = None
+    if not isinstance(data, dict):
         raise MikException(f"{Color.RED.value}Bad response from remote: {r[:200]}{Color.WHITE.value}")
-    if data.get("errors"):
-        for err in data["errors"]:
-            print(f"{Color.DIM.value}  warning: {err}{Color.WHITE.value}")
-    files = data.get("files", [])
+    for err in data.get("errors") or []:
+        print(f"{Color.DIM.value}  warning: {_printable(err)}{Color.WHITE.value}")
+    files = _checked_remote_files(data.get("files", []))
     if not files:
         print("No changes found.")
         return
@@ -1136,9 +1170,8 @@ def dev_fetch_pod(args):
         payload = json.loads(base64.b64decode(r.strip()))
     except Exception:
         raise MikException(f"{Color.RED.value}Bad fetch response{Color.WHITE.value}")
-    if payload.get("errors"):
-        for err in payload["errors"]:
-            print(f"{Color.DIM.value}  warning: {err}{Color.WHITE.value}")
+    for err in payload.get("errors") or []:
+        print(f"{Color.DIM.value}  warning: {_printable(err)}{Color.WHITE.value}")
     # Preemptive check — reject entire response if paths or statuses don't match confirmed list
     approved = {f["path"]: f["status"] for f in files}
     problems = []
@@ -1457,6 +1490,8 @@ def load_config():
         raise MikException(f"Can't read the config file: {CONFIG_FILE}") from exc
     try:
         exec(file_content, globals())
+    except MikException:  # mik's own refusal (a duplicate name, a failed step...): it says what is wrong
+        raise
     except Exception as exc:
         traceback.print_exc()
         raise MikException("Something wrong in the config file") from exc
@@ -1468,9 +1503,10 @@ def main(argv=None):
         class KeyValueAction(argparse.Action):
             def __call__(self, parser, namespace, values, option_string=None):
                 for value in values:
-                    key, val = value.split("=", 1)
-                    if key not in allowed_keys:
-                        raise MikException(f"Unknow parameter: {key}")
+                    key, _, val = value.partition("=")
+                    if key not in allowed_keys or not val:  # a bare word, an unknown key, a key with no value
+                        expected = " or ".join(f"{k}=NAME" for k in allowed_keys)
+                        parser.error(f"expected {expected}, got {value!r}")  # usage + message, exits 2
                     setattr(namespace, key, val)
 
         return KeyValueAction
@@ -1538,7 +1574,7 @@ def main(argv=None):
     parser_autocomplete = subparsers.add_parser("autocomplete", help="autocomplete help")
     parser_autocomplete.add_argument("autocomplete", metavar="INSTANCE_NAME_START")
     # parse
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     if args.debug:
         global DEBUG
         DEBUG = True
@@ -1560,14 +1596,20 @@ def main(argv=None):
     }[args.command](args)
 
 
-if __name__ == "__main__":
+def cli():
+    """What the `mik` command runs, installed (the entry point in pyproject.toml) or as `python mik.py`.
+
+    main(), with what mik expects to go wrong said in a line rather than a traceback. Returns the exit code.
+    """
     try:
-        exit(main())
+        return main()
     except KeyboardInterrupt:
         print("\n  !!  KeyboardInterrupt received  !!  \n")
-        exit(130)  # conventional 128 + SIGINT(2)
+        return 130  # conventional 128 + SIGINT(2)
     except MikException as exc:
         print(f"{Color.RED.value}\n  !!  {exc}  !!  \n{Color.WHITE.value}")
-        exit(1)
-    except Exception:
-        raise
+        return 1
+
+
+if __name__ == "__main__":
+    exit(cli())
