@@ -10,6 +10,8 @@ import io
 import json
 import os
 import re
+import shutil
+import subprocess
 import sys
 import tarfile
 import tempfile
@@ -668,6 +670,7 @@ class DeployReleaseTests(unittest.TestCase):
     We mock pop (the writability preflight) + run_step and assert the exact remote command sequence. The one
     step whose output matters is the look at the remote site root: `_survey` writes what it would print."""
 
+    S = "/var/www/site"
     R = "/var/www/site/releases"
     M = "/var/www/site/merged"
     DAY = 86400
@@ -682,79 +685,94 @@ class DeployReleaseTests(unittest.TestCase):
         return src
 
     @classmethod
-    def _survey(cls, current, releases, merged=()):
-        """What the remote prints: its clock, where `current` leads, each release with its upload date."""
-        lines = [f"now {cls.NOW}", f"current {current}"]
-        lines += [f"release {cls.NOW - age}.5 {name}" for name, age in releases]
-        lines += [f"merged {name}" for name in merged]
+    def _survey(cls, current, releases, merged=(), unfinished=()):
+        """What the remote prints: its clock, where `current` leads, what is in the four directories."""
+        lines = [f"now {cls.NOW}", f"current {current}".rstrip()]
+        lines += [f"releases d {cls.NOW - age}.5 {name}" for name, age in releases]
+        lines += [f"merged d {cls.NOW - 60}.0 {name}" for name in merged]
+        lines += [f"{path.split('/')[0]} d {cls.NOW - 3600}.0 {path.split('/')[1]}" for path in unfinished]
         return ("\n".join(lines) + "\n").encode()
 
-    def _deploy(self, survey, run_step=None, **kwargs):
-        """deploy_release of release 123 with ssh mocked; returns (pop mock, remote commands, printed lines)."""
+    def _deploy(self, survey, run_step=None, answer=None, **kwargs):
+        """deploy_release of release 123 with ssh mocked; returns (pop mock, remote commands, printed, src).
+
+        `answer` is what the user types when asked something; None means nothing may be asked."""
 
         def step(cmda, *a, **k):
             return survey if "echo now" in " ".join(cmda) else b""
 
+        asked = mock.Mock(side_effect=AssertionError("asked a question") if answer is None else answer)
+        self.cmds = []
         with tempfile.TemporaryDirectory() as d:
             src = self._src(d)
             with (
                 mock.patch.object(mik, "pop", return_value=(0, b"", b"")) as pop,
                 mock.patch.object(mik, "run_step", side_effect=run_step or step) as rs,
                 mock.patch("builtins.print") as p,
+                mock.patch("builtins.input", asked),
             ):
-                mik.deploy_release(src, "user@host", "/var/www/site", release_id="123", name="site", **kwargs)
-            return pop, _remote_cmds(rs), _printed(p), src
+                try:
+                    mik.deploy_release(src, "user@host", self.S, release_id="123", name="site", **kwargs)
+                finally:
+                    self.cmds = _remote_cmds(rs)  # also there for a test that expects the deploy to raise
+            return pop, self.cmds, _printed(p), src
 
     @staticmethod
     def _idx(cmds, sub):
         return next(i for i, c in enumerate(cmds) if sub in c)
 
-    @staticmethod
-    def _idx_exact(cmds, whole):
-        return next(i for i, c in enumerate(cmds) if c == whole)
-
-    # Four releases on the remote besides the one being shipped: two from before the last day (only the
-    # newer of them was still live when the day began), one from within it, and 123 itself, just uploaded.
-    HISTORY = [("100", 9 * DAY), ("105", 2 * DAY), ("110", DAY // 2), ("123", 10)]
+    # Three releases on the remote: two from before the last day (only the newer of them was still live
+    # when the day began) and one from within it.
+    HISTORY = [("100", 9 * DAY), ("105", 2 * DAY), ("110", DAY // 2)]
 
     def test_merge_sequence(self):
         survey = self._survey("merged/110", self.HISTORY, merged=["105", "110"])
         pop, cmds, printed, src = self._deploy(survey)
 
-        pop.assert_called_once()  # writability preflight ran
-        ship_clear = self._idx_exact(cmds, f"ssh user@host rm -rf {self.R}/.mik-STAGING-123")
-        scp = self._idx(cmds, "scp -r")
-        self.assertIn(str(src), cmds[scp])  # ships the artifact dir itself, no local copy
-        self.assertIn(f"user@host:{self.R}/.mik-STAGING-123", cmds[scp])
-        promote = self._idx(cmds, f"mv {self.R}/.mik-STAGING-123 {self.R}/123")
-        # world-readable before the mv, so the release is born readable
-        self.assertLess(cmds[promote].index("chmod -R a+rX"), cmds[promote].index(f"mv {self.R}/.mik-STAGING-123"))
+        pop.assert_called_once()  # writability preflight ran, on the four directories
+        preflight = pop.call_args.args[0][-1]
+        for where in ("releases", "merged", "releasing", "merging"):
+            self.assertIn(f"test -w {self.S}/{where}", preflight)
         look = self._idx(cmds, "echo now $(date +%s)")
         self.assertIn("readlink current", cmds[look])
-        self.assertIn("-printf 'release %T@ %f\\n'", cmds[look])
-        merge = self._idx(cmds, f"mv {self.M}/.mik-MERGING-123 {self.M}/123")
-        flip = self._idx(cmds, "ln -sfn merged/123")
+        self.assertIn("find releases merged releasing merging -mindepth 1 -maxdepth 1", cmds[look])
+        self.assertIn("-printf '%h %y %T@ %f\\n'", cmds[look])
+        scp = self._idx(cmds, "scp -r")
+        # ships the artifact dir itself, no local copy, into releasing/ — not yet a release
+        self.assertEqual(cmds[scp], f"scp -r {src} user@host:{self.S}/releasing/123")
+        ready = self._idx(cmds, f"mkdir {self.S}/merging/123")
+        live = self._idx(cmds, "ln -sfn merged/123")
         cleanup = self._idx(cmds, f"rm -rf {self.M}/105")
+        # strict ordering: look -> ship -> get ready -> go live -> delete leftovers, and nothing else
+        self.assertEqual([look, scp, ready, live, cleanup], [0, 1, 2, 3, 4])
+        self.assertEqual(len(cmds), 5)
 
-        # strict ordering: clear -> ship -> promote -> look -> build the merge -> flip -> delete leftovers
-        for earlier, later in zip(
-            [ship_clear, scp, promote, look, merge, flip], [scp, promote, look, merge, flip, cleanup]
-        ):
-            self.assertLess(earlier, later)
-
-        # the merge: the release that was live when the day began, then the one from within the day, then the
-        # new one LAST so it wins on shared names. 100 was already replaced before the day began: left out.
-        built = cmds[merge]
-        copies = [built.index(f"cp -rL {self.R}/{name}/. {self.M}/.mik-MERGING-123/") for name in ("105", "110", "123")]
+        # getting ready: the upload made world-readable, then the merge — the release that was live when the
+        # day began, the one from within the day, and the new one LAST so it wins on shared names. 100 was
+        # already replaced before the day began: left out.
+        built = cmds[ready]
+        self.assertTrue(built.startswith(f"ssh user@host chmod -R a+rX {self.S}/releasing/123 && "))
+        sources = [f"{self.R}/105", f"{self.R}/110", f"{self.S}/releasing/123"]
+        copies = [built.index(f"cp -rL {source}/. {self.S}/merging/123/") for source in sources]
         self.assertEqual(copies, sorted(copies))
         self.assertNotIn(f"{self.R}/100/", built)
-        # built under another name, made readable, and only then given its own
-        self.assertLess(copies[-1], built.index("chmod -R a+rX"))
-        self.assertLess(built.index("chmod -R a+rX"), built.index(f"mv {self.M}/.mik-MERGING-123 {self.M}/123"))
-        # the flip is an atomic rename over `current`
-        self.assertIn("mv -T", cmds[flip])
+        self.assertTrue(built.endswith(f"chmod -R a+rX {self.S}/merging/123"))
+        self.assertNotIn("ln -sfn", built)  # nothing that is served is touched while getting ready
+
+        # going live is ONE command: both directories take their names, then `current` flips (an atomic
+        # rename). So a release only ever gets into releases/ together with the flip.
+        went = cmds[live]
+        order = [
+            went.index(f"mv -T {self.S}/releasing/123 {self.R}/123"),
+            went.index(f"mv -T {self.S}/merging/123 {self.M}/123"),
+            went.index(f"ln -sfn merged/123 {self.S}/.mik-cur-tmp"),
+            went.index(f"mv -T {self.S}/.mik-cur-tmp {self.S}/current"),
+        ]
+        self.assertEqual(order, sorted(order))
+        self.assertEqual(sum(f"mv -T {self.S}/releasing/123" in c for c in cmds), 1)
+
         # deleted: the merge nobody serves any more. Not the one served until a moment ago (110), and no
-        # release: with keep=5 all four stay.
+        # release: with keep=5 all of them stay.
         self.assertEqual(cmds[cleanup], f"ssh user@host rm -rf {self.M}/105")
         # the whole thing runs without sudo (user owns the web root), and without waiting for anything
         self.assertFalse(any("sudo" in c for c in cmds))
@@ -763,64 +781,140 @@ class DeployReleaseTests(unittest.TestCase):
 
     def test_prune_keeps_what_the_next_merge_needs_and_what_was_being_served(self):
         # keep=1 asks for the new release alone; 105 and 110 are still needed to merge from, 100 is not
-        survey = self._survey("releases/100", self.HISTORY)
-        _, cmds, _, _ = self._deploy(survey, keep=1)
-        self.assertFalse(any(f"rm -rf {self.R}/1" in c for c in cmds))  # 100 was being served: next time
         survey = self._survey("merged/110", self.HISTORY, merged=["110"])
         _, cmds, _, _ = self._deploy(survey, keep=1)
         self.assertEqual(cmds[-1], f"ssh user@host rm -rf {self.R}/100")
+        # keep=2: the new one and 110. 105 stays as well (merged), 100 still goes
+        _, cmds, _, _ = self._deploy(survey, keep=2)
+        self.assertEqual(cmds[-1], f"ssh user@host rm -rf {self.R}/100")
+        # keep=4: all of them
+        _, cmds, _, _ = self._deploy(survey, keep=4)
+        self.assertIn("ln -sfn merged/123", cmds[-1])  # going live is the last thing done: nothing to delete
 
     def test_no_merge_when_zero_seconds(self):
         survey = self._survey("merged/110", self.HISTORY, merged=["105", "110"])
         _, cmds, printed, _ = self._deploy(survey, merge_seconds=0, keep=2)
         # nothing merged — `current` leads straight to the clean release
         self.assertFalse(any("cp -rL" in c for c in cmds))
-        self.assertFalse(any(".mik-MERGING" in c for c in cmds))
+        self.assertFalse(any("/merging/" in c for c in cmds))
         self.assertTrue(any("ln -sfn releases/123" in c for c in cmds))
         # 110 stays as one of the two newest; its merge stays because it was being served until now
         self.assertEqual(cmds[-1], f"ssh user@host rm -rf {self.R}/100 {self.R}/105 {self.M}/105")
         self.assertTrue(any(line.endswith("current -> releases/123") for line in printed))
 
     def test_first_deploy_serves_the_release_alone_under_its_merged_name(self):
-        _, cmds, _, _ = self._deploy(self._survey("", [("123", 5)]))
-        merge = self._idx(cmds, f"mv {self.M}/.mik-MERGING-123 {self.M}/123")
-        self.assertEqual(cmds[merge].count("cp -rL"), 1)
-        self.assertTrue(any("ln -sfn merged/123" in c for c in cmds))
-        self.assertIn("mv -T", cmds[-1])  # the flip is the last thing done: nothing to delete yet
+        _, cmds, _, _ = self._deploy(self._survey("", []))
+        self.assertEqual(cmds[2].count("cp -rL"), 1)
+        self.assertIn("ln -sfn merged/123", cmds[-1])  # going live is the last thing done: nothing to delete yet
 
-    def test_a_release_shipped_again_is_never_emptied_under_its_name(self):
-        _, cmds, _, _ = self._deploy(self._survey("merged/123", [("110", self.DAY), ("123", 5)], merged=["123"]))
-        for where, incoming in ((self.R, ".mik-STAGING-123"), (self.M, ".mik-MERGING-123")):
-            cmd = cmds[self._idx(cmds, f"mv {where}/{incoming} {where}/123")]
-            aside = cmd.index(f"mv {where}/123 {where}/.mik-OLD-123")
-            arrive = cmd.index(f"mv {where}/{incoming} {where}/123")
-            self.assertLess(aside, arrive)  # renamed aside, then replaced by a rename
-            self.assertLess(arrive, cmd.rindex(f"rm -rf {where}/.mik-OLD-123"))  # and only then deleted
-            self.assertNotIn(f"rm -rf {where}/123", cmd)
+    def test_history_begins_at_a_release_that_was_served_alone(self):
+        # `current` leads to releases/105, not merged/105: it was deployed with merge_seconds=0 so that
+        # something in 100 would disappear. 100 is not merged again, and goes — keep=5 or not.
+        history = [("100", 3 * self.DAY), ("105", 3600)]
+        _, cmds, _, _ = self._deploy(self._survey("releases/105", history))
+        self.assertNotIn(f"{self.R}/100/", cmds[2])
+        self.assertIn(f"cp -rL {self.R}/105/. {self.S}/merging/123/", cmds[2])
+        self.assertEqual(cmds[-1], f"ssh user@host rm -rf {self.R}/100")
+        # the same when 100 is recent enough to be within the day
+        _, cmds, _, _ = self._deploy(self._survey("releases/105", [("100", 7200), ("105", 3600)]))
+        self.assertNotIn(f"{self.R}/100/", cmds[2])
+        self.assertEqual(cmds[-1], f"ssh user@host rm -rf {self.R}/100")
+        # a deploy that does not merge either forgets nothing: `keep` decides, as ever
+        _, cmds, _, _ = self._deploy(self._survey("releases/105", history), merge_seconds=0)
+        self.assertIn("ln -sfn releases/123", cmds[-1])
+
+    def test_forgotten_releases(self):
+        releases = [(self.NOW - age, name) for name, age in [("100", 900), ("105", 500), ("110", 100)]]
+        self.assertEqual(mik._forgotten_releases(releases, "123", "releases/110"), ["100", "105"])
+        self.assertEqual(mik._forgotten_releases(releases, "123", "releases/105"), ["100"])
+        self.assertEqual(mik._forgotten_releases(releases, "123", "merged/110"), [])  # merged: history goes on
+        self.assertEqual(mik._forgotten_releases(releases, "123", ""), [])  # first deploy
+        self.assertEqual(mik._forgotten_releases(releases, "123", "releases/999"), [])  # leads nowhere: unknown
+        # the release being shipped is about to be replaced under that name: never listed for deletion
+        self.assertEqual(mik._forgotten_releases(releases, "100", "releases/110"), ["105"])
+
+    def test_a_release_shipped_again_is_replaced_when_going_live(self):
+        survey = self._survey("merged/123", [("110", self.DAY), ("123", 500)], merged=["123"])
+        _, cmds, _, _ = self._deploy(survey)
+        went = cmds[self._idx(cmds, "ln -sfn merged/123")]
+        for done, doing in ((self.R, "releasing"), (self.M, "merging")):
+            self.assertLess(went.index(f"rm -rf {done}/123"), went.index(f"mv -T {self.S}/{doing}/123 {done}/123"))
+        self.assertNotIn(f"{self.R}/123/.", cmds[2])  # merged from the new upload, not from its older copy
+        self.assertFalse(any(f"rm -rf {self.R}/123" in c or f"rm -rf {self.M}/123" in c for c in cmds[4:]))
+
+    def test_an_unfinished_deploy_is_shown_and_deleted_only_once_agreed(self):
+        left = ["releasing/120", "merging/120"]
+        survey = self._survey("merged/110", self.HISTORY, merged=["110"], unfinished=left)
+        # agreed: deleted before anything is uploaded, then the deploy goes on
+        _, cmds, printed, _ = self._deploy(survey, answer=["y"])
+        self.assertEqual(cmds[1], f"ssh user@host rm -rf {self.S}/releasing/120 {self.S}/merging/120")
+        self.assertIn("scp -r", cmds[2])
+        self.assertTrue(any("did not finish" in line for line in printed))
+        self.assertTrue(all(any(path in line for line in printed) for path in left))
+        self.assertTrue(any("deployed site" in line for line in printed))
+        # refused, or nobody to ask: nothing is deleted, nothing is uploaded, the deploy stops
+        for answer in (["n"], [""], EOFError):
+            with self.assertRaises(mik.MikException) as cm:
+                self._deploy(survey, answer=answer)
+            self.assertIn("releasing/120", str(cm.exception))
+            self.assertEqual(len(self.cmds), 1, self.cmds)  # the look, and nothing after it
+            self.assertIn("echo now", self.cmds[0])
 
     def test_releases_to_merge(self):
         pick = lambda releases, seconds=self.DAY: mik._releases_to_merge(  # noqa: E731
             [(self.NOW - age, name) for name, age in releases], "123", self.NOW, seconds
         )
-        self.assertEqual(pick([("123", 5)]), [])  # first deploy
+        self.assertEqual(pick([]), [])  # first deploy
         self.assertEqual(pick(self.HISTORY), ["105", "110"])
         # nothing went live in the last day: what was live all along is still what open tabs hold
-        self.assertEqual(pick([("100", 9 * self.DAY), ("105", 2 * self.DAY), ("123", 5)]), ["105"])
+        self.assertEqual(pick([("100", 9 * self.DAY), ("105", 2 * self.DAY)]), ["105"])
         # everything went live within the day: all of it, oldest first, whatever order it is listed in
-        self.assertEqual(pick([("110", 100), ("123", 5), ("105", 200)]), ["105", "110"])
+        self.assertEqual(pick([("110", 100), ("105", 200)]), ["105", "110"])
         # the release being shipped is never merged under itself, even if an older copy of it is listed
         self.assertEqual(pick([("123", 3 * self.DAY), ("110", 100)]), ["110"])
         self.assertEqual(pick(self.HISTORY, seconds=0), [])
 
-    def test_survey_only_sees_what_is_safe_to_name_in_a_remote_command(self):
+    def test_survey_is_read_strictly(self):
         out = (
             b"now 2000000\ncurrent merged/110\n"
-            b"release 1999000.25 110\nrelease 1990000.0 backup-old\nrelease soon 111\nrelease 1.0 a b\n"
-            b"merged 110\nmerged .mik-OLD-110\nmerged x;rm\nsomething else\n"
+            b"releases d 1999000.25 110\nreleases d 1990000.0 105\nmerged d 1999000.5 110\n"
+            b"releasing d 1999500.0 120\nmerging d 1999600.0 120\n"
         )
-        self.assertEqual(mik._parse_site_survey(out), (2000000, "merged/110", [(1999000.25, "110")], ["110"]))
+        self.assertEqual(
+            mik._parse_site_survey(out),
+            (
+                2000000,
+                "merged/110",
+                [(1990000.0, "105"), (1999000.25, "110")],
+                ["110"],
+                ["releasing/120", "merging/120"],
+            ),
+        )
+        self.assertEqual(mik._parse_site_survey(b"now 5\ncurrent\n"), (5, "", [], [], []))  # first deploy
+        # anything mik did not put there stops the deploy: these names would go into remote commands
+        for stray in (
+            b"releases d 1990000.0 backup-old",  # a directory made by hand
+            b"releases f 1990000.0 notes",  # not a directory
+            b"releases d 1990000.0 a b",
+            b"releases d soon 111",
+            b"merged d 1.0 x;rm",
+            b"merged d 1.0 .mik-OLD-110",
+            b"releases d 1.0 \xc3\xa9t\xc3\xa9",  # letters, but not plain ones
+            b"current ../../etc",  # `current` leading out of releases/ and merged/
+            b"current releases/a/b",
+            b"something else",
+        ):
+            with self.assertRaises(mik.MikException, msg=stray) as cm:
+                mik._parse_site_survey(out + stray + b"\n")
+            self.assertIn("unexpected", str(cm.exception))
         with self.assertRaises(mik.MikException):
             mik._parse_site_survey(b"current merged/110\n")  # no clock: the remote command did not run
+
+    def test_something_unexpected_on_the_remote_stops_before_any_change(self):
+        survey = self._survey("merged/110", self.HISTORY) + b"releases d 1.0 backup-old\n"
+        with self.assertRaises(mik.MikException):
+            self._deploy(survey)
+        self.assertEqual(len(self.cmds), 1)  # the look, and nothing after it
 
     def test_unwritable_site_root_raises_before_side_effects(self):
         with (
@@ -836,6 +930,7 @@ class DeployReleaseTests(unittest.TestCase):
         bad = [
             dict(release_id="1 2"),  # space -> not alnum
             dict(release_id="a/b"),  # slash -> not alnum
+            dict(release_id="été"),  # letters, but the remote listing is only read as plain ones
             dict(keep=0),  # the new release counts: keeping none would delete what is live
             dict(merge_seconds=-1),
             dict(site_root="relative/path"),  # not absolute
@@ -884,6 +979,149 @@ class DeployReleaseTests(unittest.TestCase):
 
         _, _, printed, _ = self._deploy(survey, run_step=boom_on_prune)
         self.assertTrue(any("deployed site" in line for line in printed))
+
+
+def _local_pop(cmda):
+    """Stands in for mik.pop with the remote on this machine: `ssh host CMD` runs CMD in a local shell and
+    `scp -r SRC host:DEST` is a local copy. The remote commands themselves run for real."""
+    if cmda[0] == "ssh":
+        argv = ["sh", "-c", cmda[2]]
+    elif cmda[:2] == ["scp", "-r"]:
+        argv = ["cp", "-r", cmda[2], cmda[3].partition(":")[2]]
+    else:
+        raise AssertionError(f"unexpected command: {cmda}")
+    proc = subprocess.run(argv, capture_output=True, stdin=subprocess.DEVNULL)
+    return proc.returncode, proc.stderr, proc.stdout
+
+
+def _remote_tools_here():
+    """Whether this machine has what deploy_release asks of the remote: find -printf and mv -T."""
+    with tempfile.TemporaryDirectory() as d:
+        probe = f"cd {d} && mkdir a && find a -maxdepth 0 -printf '%h %y %T@ %f\\n' && mv -T a b && test -d b"
+        try:
+            return subprocess.run(["sh", "-c", probe], capture_output=True).returncode == 0
+        except OSError:
+            return False
+
+
+@unittest.skipUnless(_remote_tools_here(), "needs GNU find -printf and mv -T")
+class DeployReleaseOnDiskTests(unittest.TestCase):
+    """deploy_release against a real directory: only ssh/scp are replaced (see _local_pop), so the remote
+    commands run and what is checked is what a web server following `current` would find."""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.tmp = Path(tmp.name)
+        self.site = self.tmp / "site"
+        self.site.mkdir()
+        for target, new in (("pop", _local_pop), ("print", mock.Mock())):
+            patcher = mock.patch.object(mik, target, new, create=target == "print")
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def _ship(self, rid, files, answer=None, **kwargs):
+        """Build an artifact holding `files` ({name: text}) and deploy it as release `rid`."""
+        src = self.tmp / f"build-{rid}"
+        shutil.rmtree(src, ignore_errors=True)
+        for name, text in files.items():
+            (src / name).parent.mkdir(parents=True, exist_ok=True)
+            (src / name).write_text(text)
+        asked = mock.Mock(side_effect=AssertionError("asked a question") if answer is None else [answer])
+        with mock.patch("builtins.input", asked):
+            mik.deploy_release(src, "user@host", str(self.site), release_id=rid, name="site", **kwargs)
+
+    def _age(self, rid, seconds):
+        """Make release `rid` look as if it had gone live `seconds` ago."""
+        when = (self.site / "releases" / rid).stat().st_mtime - seconds
+        os.utime(self.site / "releases" / rid, (when, when))
+
+    def _served(self):
+        """{name: text} of what `current` leads to."""
+        root = (self.site / "current").resolve()
+        return {str(p.relative_to(root)): p.read_text() for p in sorted(root.rglob("*")) if p.is_file()}
+
+    def _there(self, where):
+        return sorted(p.name for p in (self.site / where).iterdir())
+
+    def test_a_page_loaded_before_the_deploy_still_finds_its_bundles(self):
+        self._ship("1", {"index.html": "one", "a.1.js": "a1", "assets/logo.1.svg": "l1"})
+        self.assertEqual(os.readlink(self.site / "current"), "merged/1")
+        self.assertEqual(self._served(), {"index.html": "one", "a.1.js": "a1", "assets/logo.1.svg": "l1"})
+        self._ship("2", {"index.html": "two", "a.2.js": "a2"})
+        self.assertEqual(os.readlink(self.site / "current"), "merged/2")
+        # the new index wins, and what the old page names is still there
+        self.assertEqual(
+            self._served(), {"index.html": "two", "a.1.js": "a1", "a.2.js": "a2", "assets/logo.1.svg": "l1"}
+        )
+        # the releases themselves stay pristine, and nothing is left half-done
+        self.assertEqual(sorted(p.name for p in (self.site / "releases" / "2").iterdir()), ["a.2.js", "index.html"])
+        self.assertEqual((self._there("releasing"), self._there("merging")), ([], []))
+        # readable by a server that is not the owner
+        self.assertTrue(all(p.stat().st_mode & 0o004 for p in (self.site / "merged" / "2").rglob("*")))
+
+    def test_a_file_leaves_when_its_release_leaves_the_window(self):
+        self._ship("1", {"index.html": "one", "a.1.js": "a1"})
+        self._ship("2", {"index.html": "two", "a.2.js": "a2"})
+        self._age("1", 3 * 86400)
+        self._age("2", 2 * 86400)
+        # 2 was live when the last day began, 1 was replaced long before
+        self._ship("3", {"index.html": "three", "a.3.js": "a3"})
+        self.assertEqual(self._served(), {"index.html": "three", "a.2.js": "a2", "a.3.js": "a3"})
+        # what was served until a moment ago is still there; the merge before it is gone
+        self.assertEqual(self._there("merged"), ["2", "3"])
+        self.assertEqual(self._there("releases"), ["1", "2", "3"])  # keep=5
+        self._ship("4", {"index.html": "four"}, keep=1)
+        self.assertEqual(self._there("merged"), ["3", "4"])
+        self.assertEqual(self._there("releases"), ["2", "3", "4"])  # 2 and 3 are what the next merge may need
+
+    def test_a_page_removed_with_merge_seconds_0_stays_removed(self):
+        self._ship("1", {"index.html": "one", "secret.html": "oops"})
+        self._ship("2", {"index.html": "two"}, merge_seconds=0)
+        self.assertEqual(os.readlink(self.site / "current"), "releases/2")
+        self.assertEqual(self._served(), {"index.html": "two"})
+        self._ship("3", {"index.html": "three", "a.3.js": "a3"})
+        self.assertEqual(self._served(), {"index.html": "three", "a.3.js": "a3"})
+        self.assertEqual(self._there("releases"), ["2", "3"])  # 1 is gone for good
+        self._ship("4", {"index.html": "four"})
+        self.assertEqual(self._served(), {"index.html": "four", "a.3.js": "a3"})
+
+    def test_an_upload_that_never_went_live_is_never_merged(self):
+        self._ship("1", {"index.html": "one", "a.1.js": "a1"})
+        # release 2 was uploaded, then its deploy died: it sits in releasing/, and half a merge in merging/
+        shutil.copytree(self.tmp / "build-1", self.site / "releasing" / "2")
+        (self.site / "releasing" / "2" / "never.js").write_text("never live")
+        (self.site / "merging" / "2").mkdir()
+        before = self._served()
+        with self.assertRaises(mik.MikException):
+            self._ship("3", {"index.html": "three"}, answer="n")
+        # refused: everything is as it was, the leftovers too
+        self.assertEqual((self._served(), self._there("releasing"), self._there("merging")), (before, ["2"], ["2"]))
+        self.assertEqual(self._there("releases"), ["1"])
+        self._ship("3", {"index.html": "three"}, answer="y")
+        self.assertEqual(self._served(), {"index.html": "three", "a.1.js": "a1"})
+        self.assertEqual((self._there("releasing"), self._there("merging")), ([], []))
+        self.assertEqual(self._there("releases"), ["1", "3"])
+
+    def test_the_same_release_can_be_shipped_again(self):
+        self._ship("1", {"index.html": "one", "a.1.js": "a1"})
+        self._ship("2", {"index.html": "two", "a.2.js": "a2"})
+        self._ship("2", {"index.html": "two again", "b.2.js": "b2"})  # while it is live
+        self.assertEqual(self._served(), {"index.html": "two again", "a.1.js": "a1", "b.2.js": "b2"})
+        self.assertEqual(self._there("releases"), ["1", "2"])
+        self.assertEqual(self._there("merged"), ["2"])
+        self._ship("2", {"index.html": "two alone"}, merge_seconds=0)
+        self._ship("2", {"index.html": "two alone again"}, merge_seconds=0)
+        self.assertEqual(self._served(), {"index.html": "two alone again"})
+
+    def test_something_mik_did_not_put_there_stops_the_deploy(self):
+        self._ship("1", {"index.html": "one"})
+        (self.site / "releases" / "backup-old").mkdir()
+        with self.assertRaises(mik.MikException) as cm:
+            self._ship("2", {"index.html": "two"})
+        self.assertIn("backup-old", str(cm.exception))
+        self.assertEqual(self._served(), {"index.html": "one"})
+        self.assertEqual(self._there("releasing"), [])  # stopped before the upload
 
 
 class ReadmeSyncTests(unittest.TestCase):

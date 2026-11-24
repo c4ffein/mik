@@ -11,6 +11,7 @@ import tempfile
 import string
 import base64
 import os
+import re
 import traceback
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
@@ -586,7 +587,7 @@ def _assert_artifact_has_no_links(src):
 
     Defense-in-depth at the deploy chokepoint, independent of how the artifact was built: deploy can ship
     one produced by older code or a different build path (tar extract, copytree, ...), and `scp -r` / the
-    overlap `cp -rL` both dereference symlinks — a stray link would copy its target straight into the public
+    merge `cp -rL` both dereference symlinks — a stray link would copy its target straight into the public
     web root. Only regular files and directories may ship. os.walk(followlinks=False) lists a symlinked dir
     but never descends into it, so links are reported, never followed; islink is checked before is_file/
     is_dir (which would follow the link) so the link itself is what we catch.
@@ -702,60 +703,89 @@ def validate_code_dir(s):
             raise MikException(f"bad char {c!r} in code_dir: {s!r}")
 
 
-def _flip_current(ssh_host, site_root, target):
-    """Atomically point {site_root}/current at `target` (a path *relative to site_root*).
+def _flip_current_cmd(site_root, target):
+    """The remote command that atomically points {site_root}/current at `target` (*relative to site_root*).
 
-    rename(2) is the only atomic replace — symlink(2) refuses to overwrite — so the canonical move is to
-    materialise the new link under a temp name, then rename it onto `current`. `ln -sfn` builds (or
-    overwrites a crash-leftover of) that temp link in one (non-atomic) step (`-f` force, `-n` so it never
-    descends into a leftover symlink-to-a-dir), and `mv -T` does the atomic rename, so a serving nginx never
-    sees `current` momentarily absent. The temp name is fixed, so a crash leaves at most one stale link that
-    the next flip reclaims — the two flips are sequential, never concurrent, so they can share it.
+    `current` is a symlink and nothing more. rename(2) is the only atomic replace — symlink(2) refuses to
+    overwrite — so the canonical move is to materialise the new link under a temp name, then rename it onto
+    `current`. `ln -sfn` builds (or overwrites a crash-leftover of) that temp link in one (non-atomic) step
+    (`-f` force, `-n` so it never descends into a leftover symlink-to-a-dir), and `mv -T` does the atomic
+    rename, so a serving nginx never sees `current` momentarily absent. The temp name is fixed, so a crash
+    leaves at most one stale link, which the next flip reclaims.
 
-    No sudo: the web root is owned by the ssh user (see deploy_release). Precondition: caller passes
-    already-validated, shell-safe `ssh_host`/`site_root` and a relative `target` composed from them.
+    Returned, not run: deploy_release puts it at the end of the very command that gives the release its
+    name. Precondition: caller passes an already-validated, shell-safe `site_root` and a relative `target`
+    composed from validated parts.
     """
     tmp = f"{site_root}/.mik-cur-tmp"
-    run_step(["ssh", ssh_host, f"ln -sfn {target} {tmp} && mv -T {tmp} {site_root}/current"])
+    return f"ln -sfn {target} {tmp} && mv -T {tmp} {site_root}/current"
+
+
+# What deploy_release owns under a site root, beside the `current` link. A directory's place says where it
+# stands: being uploaded, uploaded and live at some point, being merged, merged and served at some point.
+_SITE_DIRS = ("releases", "merged", "releasing", "merging")
+_SITE_SURVEY_LINE = re.compile(
+    r"now (?P<now>[0-9]+)"
+    r"|current(?: (?P<current>(?:releases|merged)/[A-Za-z0-9]+))?"
+    rf"|(?P<where>{'|'.join(_SITE_DIRS)}) d (?P<when>[0-9]+(?:\.[0-9]+)?) (?P<entry>[A-Za-z0-9]+)"
+)
 
 
 def _parse_site_survey(out):
-    """What a remote look at {site_root} found: (now, current_target, [(mtime, release)], [merged]).
+    """What a remote look at {site_root} found: (now, current, releases, merged, unfinished).
 
-    One tagged line per fact, as _survey_site prints them. Names are interpolated into later remote
-    commands (cp, rm -rf), so anything that is not plain alnum — a directory somebody made by hand — is
-    simply not seen: never merged, never deleted.
+    `releases` is [(date, name)], oldest first; `merged` is [name]; `unfinished` is what sits in releasing/
+    and merging/, as paths relative to the site root; `current` is where the link leads ("" if there is
+    none yet). One line per fact, as the survey command prints them, and every line has to be one of those
+    expected: these directories are mik's own, and the names in them go into later remote commands (cp, mv,
+    rm -rf). Anything else — a file, a directory made by hand, a name that is not plain letters and digits,
+    a `current` that leads elsewhere — stops the deploy here, before anything is changed.
     """
-    now, current, releases, merged = None, "", [], []
-    for line in out.decode(errors="replace").splitlines():
-        tag, _, rest = line.partition(" ")
-        rest = rest.strip()
-        if tag == "now" and rest.isdigit():
-            now = int(rest)
-        elif tag == "current":
-            current = rest
-        elif tag == "release":
-            stamp, _, entry = rest.partition(" ")
-            try:
-                when = float(stamp)
-            except ValueError:
-                continue
-            if entry.isalnum():
-                releases.append((when, entry))
-        elif tag == "merged" and rest.isalnum():
-            merged.append(rest)
+    now, current, found = None, "", {where: [] for where in _SITE_DIRS}
+    for line in out.decode(errors="replace").split("\n"):
+        if not line:
+            continue
+        fact = _SITE_SURVEY_LINE.fullmatch(line)
+        if fact is None:
+            raise MikException(
+                f"unexpected in the remote site root: {line!r}\n"
+                f"mik expects `current` to lead to releases/<id> or merged/<id>, and nothing but release "
+                f"directories (letters and digits) in {', '.join(f'{where}/' for where in _SITE_DIRS)}. "
+                f"Move away what does not belong there, then deploy again."
+            )
+        if fact["now"]:
+            now = int(fact["now"])
+        elif fact["where"]:
+            found[fact["where"]].append((float(fact["when"]), fact["entry"]))
+        else:
+            current = fact["current"] or ""
     if now is None:
         raise MikException(f"could not read the state of the remote site root:\n{out.decode(errors='replace')}")
-    return now, current, sorted(releases), merged
+    unfinished = [f"{where}/{entry}" for where in ("releasing", "merging") for _, entry in sorted(found[where])]
+    return now, current, sorted(found["releases"]), sorted(entry for _, entry in found["merged"]), unfinished
+
+
+def _forgotten_releases(releases, rid, serving):
+    """The releases from before the one `current` leads to, when it leads to a release itself.
+
+    `current` -> releases/S (and not merged/S) says that S was deployed to be served alone: since then,
+    nothing else was. So history begins at S. What came before it is not merged under a later release —
+    this is what makes a page removed with merge_seconds=0 stay removed — and is deleted, `keep` or not:
+    left there, it would be picked up again one deploy later, when `current` no longer tells.
+    """
+    where, _, served = serving.partition("/")
+    since = [when for when, entry in releases if where == "releases" and entry == served]
+    return [entry for when, entry in sorted(releases) if since and when < since[0] and entry != rid]
 
 
 def _releases_to_merge(releases, rid, now, merge_seconds):
     """The earlier releases whose files stay available under the new one, oldest first.
 
-    `releases` is [(mtime, name)]: a release directory's own date is when it was uploaded, so when it
-    went live. A page that is open in somebody's browser was loaded from whatever was live at the time:
-    so a tab up to merge_seconds old may hold any release that went live within that time, or the one
-    that already was live when that time began — the newest of those from before. Nothing older.
+    `releases` is [(date, name)]: a release directory gets its name in the command that makes it live, and
+    its own date is from the upload just before. A page that is open in somebody's browser was loaded from
+    whatever was live at the time: so a tab up to merge_seconds old may hold any release that went live
+    within that time, or the one that already was live when that time began — the newest of those from
+    before. Nothing older.
     """
     if merge_seconds <= 0:
         return []
@@ -775,37 +805,46 @@ def _site_leftovers(releases, merged, rid, serving, merging, keep):
     server that follows `current` on a timer rather than per request is still reading from that directory
     for a few seconds after the flip, so it goes at the next deploy, not at this one.
     """
-    newest = [entry for _, entry in sorted(releases) if entry != rid][-max(int(keep) - 1, 0) :] if keep > 1 else []
+    others = [entry for _, entry in sorted(releases) if entry != rid]
+    newest = others[max(len(others) - (keep - 1), 0) :]  # the new release is one of the `keep`
     was_dir, _, was = serving.partition("/")
     keep_releases = {rid, *merging, *newest} | ({was} if was_dir == "releases" else set())
     keep_merged = {rid} | ({was} if was_dir == "merged" else set())
     return (
-        [entry for _, entry in sorted(releases) if entry not in keep_releases],
+        [entry for entry in others if entry not in keep_releases],
         [entry for entry in sorted(merged) if entry not in keep_merged],
     )
 
 
 def deploy_release(src, ssh_host, site_root, release_id, name, keep=5, merge_seconds=86400):
-    """Atomic zero-downtime deploy of an already-built artifact. No rsync, no shell pipes, no sudo.
+    """Zero-downtime deploy of an already-built artifact. No rsync, no shell pipes, no sudo.
 
     Config helper — the *deploy* half of build/deploy. `src` is a finished artifact directory (typically
     from latest_release()/resolve_release()); choosing, excluding and transforming files is the *build*
-    step's job (see build_artifact), so this ships src as-is. It scp's src into {site_root}/releases/{id},
-    makes it world-readable, then flips the `current` symlink the web server serves through. Nothing is
-    ever changed in a directory that is being served: every step builds a new one beside it, and the flip
-    is a rename.
+    step's job (see build_artifact), so this ships src as-is, then flips the `current` symlink the web
+    server serves through.
 
     Runs entirely as the ssh user — *no sudo*. The web root must be owned/writable by that user (a one-time
     `chown -R <user> {site_root}`); a preflight check fails fast with that instruction if it isn't. A
     containerized web server serving from a bind mount reads files by their world-readable ("other") bits
     regardless of host ownership, which is why everything is `chmod -R a+rX`'d before it's served.
 
+    What is on the remote. Four directories under {site_root}, all mik's own, and where a directory is
+    says where it stands:
+      releasing/{id}  being uploaded
+      releases/{id}   the pristine build. It gets this name in the same command that flips `current`, so a
+                      release that is in there went live.
+      merging/{id}    a merge being put together
+      merged/{id}     a merge that `current` was pointed at
+    They must be on one filesystem (they are, unless one was mounted apart): going from releasing/ to
+    releases/ is then a rename. `current` only ever leads to a directory that is complete.
+
     What is served. With merge_seconds > 0 (a day by default), `current` does not point at the release
-    itself but at {site_root}/merged/{id}: the releases that went live in the last merge_seconds, plus the
-    one that was live before that, copied over one another from oldest to newest, the new release last (so
-    it wins on every name they share, index.html first of all). {site_root}/releases/{id} stays the
-    pristine build: the next deploy merges from those, never from a merge, so a file leaves when its
-    release leaves the window. With merge_seconds=0, `current` points at the clean release.
+    itself but at merged/{id}: the releases that went live in the last merge_seconds, plus the one that was
+    live before that, copied over one another from oldest to newest, the new release last (so it wins on
+    every name they share, index.html first of all). The next deploy merges from releases/, never from a
+    merge, so a file leaves when its release leaves the window. With merge_seconds=0, `current` points at
+    the clean release.
 
     Why merge. A browser that loaded index.html before the deploy still asks for the hashed bundles that
     page names, and a clean new release no longer has them: a 404, a broken tab. Under the merge, a tab up
@@ -816,22 +855,32 @@ def deploy_release(src, ssh_host, site_root, release_id, name, keep=5, merge_sec
 
     What it costs. A file removed from a build keeps being served until the first deploy made more than
     merge_seconds after the one that removed it — the merge is only made when deploying. For a bundle
-    nobody asks for, nothing; for a page that had to disappear, deploy with merge_seconds=0.
+    nobody asks for, nothing; for a page that had to disappear, deploy with merge_seconds=0. That begins
+    history again: the next deploy that merges sees `current` leading to a release served alone, merges
+    nothing from before it, and deletes those earlier releases — whatever `keep` says.
 
     What is deleted, and when. Releases beyond the `keep` newest, unless a later merge may still need
     them; merged directories other than the new one. Never, in the same deploy, the directory that was
     being served until the flip: a server that looks at where `current` leads every few seconds, rather
-    than on every request, is still reading from it for that long. It goes at the next deploy.
+    than on every request, is still reading from it for that long. It goes at the next deploy. One
+    exception: shipping again the id that is live right now replaces that directory under its name, and
+    requests get 404s while that takes.
 
-    Inputs land in a remote shell and in paths, so they're validated up front. Needs GNU find on the
-    remote (Debian has it).
+    When a deploy fails. Any step may: run it again. What a failed one left in releasing/ or merging/ is
+    shown and, once you agree, deleted (the same would show if another deploy were running right now —
+    then say no). It never went live and is never merged. Anything else that mik did not put in those
+    four directories stops the deploy before it changes a thing.
+
+    Inputs land in a remote shell and in paths, so they're validated up front. Needs GNU find and mv on the
+    remote (Debian has them).
     """
     rid = str(release_id)
-    if not rid.isalnum():  # lands in a remote shell + a path — keep it boring
+    if not (rid.isascii() and rid.isalnum()):  # lands in a remote shell + a path — keep it boring
         raise MikException(f"unsafe release_id: {rid!r}")
-    if int(keep) < 1:  # the new release itself counts: keeping none of them would delete what is live
+    keep, merge_seconds = int(keep), int(merge_seconds)
+    if keep < 1:  # the new release itself counts: keeping none of them would delete what is live
         raise MikException("keep must be >= 1")
-    if int(merge_seconds) < 0:
+    if merge_seconds < 0:
         raise MikException("merge_seconds must be >= 0 (0 serves the release alone)")
     validate_code_dir(site_root)  # absolute, no '..', boring chars — it's interpolated into a remote target
     for part in ssh_host.split("@"):
@@ -840,49 +889,24 @@ def deploy_release(src, ssh_host, site_root, release_id, name, keep=5, merge_sec
         except Exception as exc:
             raise MikException(f"unsafe ssh_host: {ssh_host!r}") from exc
     _assert_artifact_has_no_links(src)  # payload check, before any remote contact: scp -r/cp -rL deref links
-    # Invariant from here on: rid is alnum and site_root is a clean absolute path, so every remote string
-    # composed below ({site_root}/releases/{rid}, .mik-STAGING-{rid}, merged/{rid}, ...) is shell-safe by
-    # construction, and so is every other release name: _parse_site_survey only lets alnum ones through.
-    # That's why the sinks below — including _flip_current — interpolate without re-checking.
+    # Invariant from here on: rid is ascii alnum and site_root is a clean absolute path, so every remote
+    # string composed below ({site_root}/releases/{rid}, releasing/{rid}, merged/{rid}, ...) is shell-safe by
+    # construction, and so is every other release name: _parse_site_survey raises on any that is not.
+    # That's why the sinks below interpolate without re-checking.
     # (`name` is a log label only — it no longer reaches a shell or a path — so it needs no validation.)
-    releases_dir = f"{site_root}/releases"  # every release for this instance, pristine, as uploaded
-    merged_root = f"{site_root}/merged"  # what `current` leads to when releases are merged
-    new_release_dir = f"{releases_dir}/{rid}"
-    staging_dir = f"{releases_dir}/.mik-STAGING-{rid}"  # transient upload target (dotfile: never listed)
-    merged_dir = f"{merged_root}/{rid}"
-    # 0. preflight: make releases/ and confirm it's writable AS THE SSH USER, so we fail with an actionable
-    #    message instead of a cryptic scp/rm permission error mid-deploy. Everything below runs without sudo.
-    rc, err, _ = pop(["ssh", ssh_host, f"mkdir -p {releases_dir} && test -w {releases_dir}"])
+    releases_dir, merged_dir, releasing_dir, merging_dir = (f"{site_root}/{where}" for where in _SITE_DIRS)
+    site_dirs = [releases_dir, merged_dir, releasing_dir, merging_dir]
+    # 0. preflight: make the four directories and confirm they're writable AS THE SSH USER, so we fail with
+    #    an actionable message instead of a cryptic scp/rm permission error mid-deploy. No sudo anywhere.
+    preflight = " && ".join([f"mkdir -p {' '.join(site_dirs)}", *[f"test -w {path}" for path in site_dirs]])
+    rc, err, _ = pop(["ssh", ssh_host, preflight])
     if rc != 0:
         raise MikException(
-            f"{releases_dir} is not writable over ssh as {ssh_host} (rc={rc}). mik deploys without sudo — "
+            f"{site_root} is not writable over ssh as {ssh_host} (rc={rc}). mik deploys without sudo — "
             f"own the web root with the deploy user, e.g. `ssh {ssh_host} sudo chown -R \\$USER {site_root}`."
         )
-    # 1. ship the built artifact as-is (scp = argv, no shell), clearing any half-done previous attempt
-    run_step(["ssh", ssh_host, f"rm -rf {staging_dir}"])
-    run_step(["scp", "-r", str(src), f"{ssh_host}:{staging_dir}"])
-    # 2. make the upload world-readable (a containerized server reads by 'other' bits), then promote it to a
-    #    fresh immutable release dir — same filesystem, so the mv is an atomic rename. If this rid is there
-    #    already (shipped again, perhaps while it is live), the old copy is renamed aside first and deleted
-    #    after: a directory is never emptied under its name.
-    aside = f"{releases_dir}/.mik-OLD-{rid}"
-    run_step(
-        [
-            "ssh",
-            ssh_host,
-            " && ".join(
-                [
-                    f"chmod -R a+rX {staging_dir}",
-                    f"rm -rf {aside}",
-                    f"(mv {new_release_dir} {aside} 2>/dev/null || true)",
-                    f"mv {staging_dir} {new_release_dir}",
-                    f"rm -rf {aside}",
-                ]
-            ),
-        ]
-    )
-    # 3. look at what is there: the remote clock, where `current` leads, each release with the date it was
-    #    uploaded (its directory's own), the merged directories. Read-only; choosing happens here, in Python.
+    # 1. look at what is there: the remote clock, where `current` leads, and everything in the four
+    #    directories with its kind and date. Read-only; choosing happens here, in Python.
     survey = run_step(
         [
             "ssh",
@@ -892,48 +916,56 @@ def deploy_release(src, ssh_host, site_root, release_id, name, keep=5, merge_sec
                     f"cd {site_root}",
                     "echo now $(date +%s)",
                     "echo current $(readlink current 2>/dev/null)",
-                    "find releases -mindepth 1 -maxdepth 1 -type d ! -name '.*' -printf 'release %T@ %f\\n'",
-                    "(find merged -mindepth 1 -maxdepth 1 -type d -printf 'merged %f\\n' 2>/dev/null || true)",
+                    f"find {' '.join(_SITE_DIRS)} -mindepth 1 -maxdepth 1 -printf '%h %y %T@ %f\\n'",
                 ]
             ),
         ]
     )
-    now, serving, releases, merged = _parse_site_survey(survey)
-    merging = _releases_to_merge(releases, rid, now, int(merge_seconds))
-    # 4. what `current` will lead to. Merged: a new directory, the earlier releases copied in from oldest to
-    #    newest and this one last, so that it wins on shared names. Built whole under another name, made
-    #    readable, and only then given its own; an earlier merge of this rid goes aside first, as in 2.
-    if int(merge_seconds) > 0:
-        building = f"{merged_root}/.mik-MERGING-{rid}"
-        aside = f"{merged_root}/.mik-OLD-{rid}"
-        run_step(
-            [
-                "ssh",
-                ssh_host,
-                " && ".join(
-                    [
-                        f"rm -rf {building}",
-                        f"mkdir -p {building}",
-                        *[f"cp -rL {releases_dir}/{entry}/. {building}/" for entry in merging],
-                        f"cp -rL {new_release_dir}/. {building}/",
-                        f"chmod -R a+rX {building}",
-                        f"rm -rf {aside}",
-                        f"(mv {merged_dir} {aside} 2>/dev/null || true)",
-                        f"mv {building} {merged_dir}",
-                        f"rm -rf {aside}",
-                    ]
-                ),
-            ]
-        )
+    now, serving, releases, merged, unfinished = _parse_site_survey(survey)
+    # 2. what an earlier deploy started and did not finish: shown, and deleted only once the user agrees —
+    #    from here it cannot be told apart from another deploy that is running right now.
+    if unfinished:
+        print(f"warning: a deploy to {ssh_host}:{site_root} did not finish, or is still running. Left there:")
+        for path in unfinished:
+            print(f"  {path}")
+        try:
+            answer = input("Delete these and carry on? [y/N] ")
+        except EOFError:  # nobody to ask
+            answer = ""
+        if answer.strip().lower() != "y":
+            raise MikException(f"not deploying {name}: unfinished deploy left in {site_root} ({', '.join(unfinished)})")
+        run_step(["ssh", ssh_host, "rm -rf " + " ".join(f"{site_root}/{path}" for path in unfinished)])
+    # 3. ship the built artifact as-is (scp = argv, no shell). releasing/ is empty by now, so the directory
+    #    scp makes is the artifact itself.
+    run_step(["scp", "-r", str(src), f"{ssh_host}:{releasing_dir}/{rid}"])
+    # 4. get ready, beside what is served: the upload made world-readable (a containerized server reads by
+    #    'other' bits) and, when merging, the merge — the earlier releases copied in from oldest to newest and
+    #    this one last, so that it wins on shared names.
+    forgotten = _forgotten_releases(releases, rid, serving) if merge_seconds > 0 else []
+    remembered = [(when, entry) for when, entry in releases if entry not in forgotten]
+    merging = _releases_to_merge(remembered, rid, now, merge_seconds)
+    ready = [f"chmod -R a+rX {releasing_dir}/{rid}"]
+    go_live = [f"rm -rf {releases_dir}/{rid}", f"mv -T {releasing_dir}/{rid} {releases_dir}/{rid}"]
+    target = f"releases/{rid}"
+    if merge_seconds > 0:
+        ready += [
+            f"mkdir {merging_dir}/{rid}",
+            *[f"cp -rL {releases_dir}/{entry}/. {merging_dir}/{rid}/" for entry in merging],
+            f"cp -rL {releasing_dir}/{rid}/. {merging_dir}/{rid}/",
+            f"chmod -R a+rX {merging_dir}/{rid}",
+        ]
+        go_live += [f"rm -rf {merged_dir}/{rid}", f"mv -T {merging_dir}/{rid} {merged_dir}/{rid}"]
         target = f"merged/{rid}"
-    else:
-        target = f"releases/{rid}"
-    # 5. flip `current` (atomic rename, never absent)
-    _flip_current(ssh_host, site_root, target)
+    run_step(["ssh", ssh_host, " && ".join(ready)])
+    # 5. go live, in one command: each directory takes its name (a rename; the `rm -rf` only finds something
+    #    when this id was shipped before) and `current` flips to it (atomic rename, never absent). A release
+    #    is named in releases/ here and nowhere else — that is what "it is in releases/" tells the next deploy.
+    run_step(["ssh", ssh_host, " && ".join([*go_live, _flip_current_cmd(site_root, target)])])
     # 6. delete what nothing needs any more — never what was being served until a moment ago (best-effort;
     #    failure here must not fail the deploy)
-    old_releases, old_merged = _site_leftovers(releases, merged, rid, serving, merging, int(keep))
-    doomed = [f"{releases_dir}/{entry}" for entry in old_releases] + [f"{merged_root}/{entry}" for entry in old_merged]
+    old_releases, old_merged = _site_leftovers(remembered, merged, rid, serving, merging, keep)
+    doomed = [f"{releases_dir}/{entry}" for entry in [*forgotten, *old_releases]]
+    doomed += [f"{merged_dir}/{entry}" for entry in old_merged]
     if doomed:
         try:
             run_step(["ssh", ssh_host, "rm -rf " + " ".join(doomed)])
