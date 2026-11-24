@@ -8,7 +8,7 @@ help:
 	@echo "  make format-check  - Check formatting without fixing"
 	@echo "  make test          - Run the test suite"
 	@echo "  make fast-validate - Run lint-check + format-check + test"
-	@echo "  make verify        - Read-only gate: pinned ruff check + test suite (no env needed)"
+	@echo "  make verify        - Read-only gate: pinned ruff check + format check + test suite (no env needed)"
 
 lint:
 	uv run ruff check --fix; uv run ruff format
@@ -28,4 +28,5 @@ fast-validate: lint-check format-check test
 # version resolved in uv.lock (throwaway via uvx, no venv) + the stdlib-only test suite directly.
 verify:
 	uvx ruff@0.15.20 check --no-fix .
+	uvx ruff@0.15.20 format --check .
 	python3 test.py

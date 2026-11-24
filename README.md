@@ -59,8 +59,12 @@ class MyServer(Instance):
         "make deploy",
     ]
     # deploy_shell = "/bin/bash"          # optional interpreter for the deploy lines (default /bin/bash)
-    # get_remote_source = ["..."]         # optional shell lines for `mik get-remote-source`
 ```
+
+Because the config runs in mik's namespace, a name of mik's own that it defines again (a
+helper called `build`, say) would replace mik's: that is refused when the config is loaded,
+naming it. The settings a config is meant to give a value to are the exception
+(`ROOT_CA_FILE`, `GITHUB_COM_CERT_SHA256`, `GITHUB_IO_CERT_SHA256`, `ARTIFACTS_DIR`, `RUNS_DIR`).
 
 ### Python deploy / build steps
 
@@ -125,7 +129,6 @@ list; a `mik help <command>` surfacing them is on the TODO list).
   mik deploy <instance>                 ==> run the instance's deploy() method or "deploy" script
     + <RELEASE_ID>                      ==> ship/roll back to a local artifact (Python deploys only)
   mik build <instance>                  ==> run the instance's build() method (local artifact, no remote)
-  mik get-remote-source <instance>      ==> run the instance's get_remote_source script
   mik dev-fetch-pod <instance>          ==> pull changed files out of the instance's remote container
   mik autocomplete <prefix>             ==> instance names starting with <prefix>
 
@@ -136,15 +139,17 @@ list; a `mik help <command>` surfacing them is on the TODO list).
 ### `dev-fetch-pod`
 Resolves the instance's `machine.ssh_host`, `container` and `code_dir`, runs
 `git status` inside the remote container over ssh, shows you the changed / new
-/ deleted files, and — only after you confirm — fetches their contents and
-writes them into the project's `local_repo`. Paths are validated on both ends
+/ deleted files (what the pod's `.gitignore` ignores stays out; a rename is a
+deletion and a new file), and — only after you confirm — fetches their contents
+and writes them into the project's `local_repo`. Paths are validated on both ends
 (no absolute paths, no `..`, no `.git/`, symlinks rejected) and the fetched set
 is checked against exactly what you confirmed before anything is written.
 
 ### Run records
-`deploy` and `get-remote-source` stream their output live while capturing it,
-and persist one JSON record per run (combined output, return code, timing)
-under `~/.local/state/mik/runs/` for later inspection.
+A script `deploy` (a list of shell lines) streams its output live while
+capturing it, and persists one JSON record per run (combined output, return
+code, timing) under `~/.local/state/mik/runs/` for later inspection. A Python
+`deploy` gets the same from `run_and_capture` + `record_run`.
 
 ## Help
 
@@ -152,12 +157,12 @@ Raw `mik --help` output (kept in sync with the code by `test.py`, rendered at 80
 
 ```
 usage: mik [-h] [--debug]
-           {list,list-machines,list-instances,list-projects,deploy,build,get-remote-source,dev-fetch-pod,ci-status,autocomplete} ...
+           {list,list-machines,list-instances,list-projects,deploy,build,dev-fetch-pod,ci-status,autocomplete} ...
 
 mik
 
 positional arguments:
-  {list,list-machines,list-instances,list-projects,deploy,build,get-remote-source,dev-fetch-pod,ci-status,autocomplete}
+  {list,list-machines,list-instances,list-projects,deploy,build,dev-fetch-pod,ci-status,autocomplete}
                         sub-command help
     list                list everything: instances and projects with their
                         links
@@ -166,7 +171,6 @@ positional arguments:
     list-projects       list projects
     deploy              deploy an instance
     build               build an instance's local artifact
-    get-remote-source   run an instance's get_remote_source
     dev-fetch-pod       Fetch changed files from an instance's container
     ci-status           Check default-branch pipeline status (or ALL)
     autocomplete        autocomplete help

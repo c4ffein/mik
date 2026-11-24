@@ -230,6 +230,15 @@ class RunStepTests(unittest.TestCase):
             mik.run_step(["sh", "-c", "echo boom >&2; exit 2"])
         self.assertIn("sh -c", str(cm.exception))
 
+    def test_stderr_in_the_error_cannot_carry_escape_sequences(self):
+        # for an ssh step, the one writing on stderr is the remote
+        noise = "printf 'boom \\033[2J\\033[H\\nline 2\\n' >&2"
+        for script, strict in ((f"{noise}; exit 3", False), (noise, True)):
+            with self.subTest(strict=strict), self.assertRaises(mik.MikException) as cm:
+                mik.run_step(["sh", "-c", script], fail_on_stderr=strict)
+            self.assertTrue(str(cm.exception).endswith("\nboom [2J[H\nline 2"), str(cm.exception))
+            self.assertNotIn("\033", str(cm.exception).split("\n", 1)[1])
+
     def test_stderr_tolerated_by_default(self):
         # ssh/scp/git write to stderr on success — default must not raise on that.
         self.assertEqual(mik.run_step(["sh", "-c", "echo oops >&2"]), b"")
@@ -416,6 +425,10 @@ class DevFetchPodTests(unittest.TestCase):
             {"path": "/etc/outside.txt", "status": "M"},
             {"path": ".git/hooks/pre-commit", "status": "A"},
             {"path": "a\033[2K.txt", "status": "M"},  # an escape sequence, to rewrite what is shown
+            {"path": 'hello" : " \\" \\ "', "status": "A"},  # quotes and backslashes, to get out of a string
+            {"path": 'a"]; import os; os.system("id") #', "status": "A"},
+            {"path": "a$(id).txt", "status": "A"},
+            {"path": "a b.txt", "status": "A"},
             {"path": "a.txt", "status": "\033[2K"},
             {"path": "a.txt"},
             {"path": ["a.txt"], "status": "M"},
@@ -437,6 +450,69 @@ class DevFetchPodTests(unittest.TestCase):
                 self.assertEqual(remote.call_count, 1)  # never got to the fetch
                 self.assertEqual(list(Path(d).rglob("*")), [repo])  # nothing written, inside or outside
 
+    def test_only_the_path_and_the_status_go_back_to_the_pod(self):
+        # What a pod puts beside them is dropped: the confirmed list is written into the fetch script.
+        entry = {"path": "a.txt", "status": "M", "x": 'q" + __import__("os").getcwd() + "', "n": None}
+        self.assertEqual(mik._checked_remote_files([entry]), [{"path": "a.txt", "status": "M"}])
+        fetch_resp = mik.base64.b64encode(json.dumps({"files": {"a.txt": "aGk="}, "deleted": []}).encode())
+        list_resp = json.dumps({"files": [entry], "errors": []}).encode()
+        with tempfile.TemporaryDirectory() as d:
+            self._setup(d)
+            with (
+                mock.patch.object(
+                    mik, "_run_remote_script", side_effect=[(0, b"", list_resp), (0, b"", fetch_resp)]
+                ) as remote,
+                mock.patch("builtins.input", return_value="y"),
+                mock.patch("builtins.print"),
+            ):
+                mik.dev_fetch_pod(SimpleNamespace(instance="inst"))
+        fetch_script = remote.call_args_list[1].args[2]
+        self.assertIn('file_list = [{"path": "a.txt", "status": "M"}]\n', fetch_script)
+        self.assertNotIn("getcwd", fetch_script)
+
+    def test_a_fetch_answer_that_is_wrong_somewhere_writes_nothing(self):
+        # Two files confirmed; the first one's content is fine every time, so anything written shows.
+        ok = mik.base64.b64encode(b"x").decode()
+        for name, payload in (
+            ("content is a number", {"files": {"a.txt": ok, "b.txt": 5}, "deleted": []}),
+            ("content is not base64", {"files": {"a.txt": ok, "b.txt": "not base64!"}, "deleted": []}),
+            (
+                "a path with an escape sequence",
+                {"files": {"a.txt": ok, "b.txt": ok, "e\033[2J.txt": ok}, "deleted": []},
+            ),
+            ("a list instead of an object", [ok, ok]),
+            ("files is a list", {"files": ["a.txt", "b.txt"], "deleted": []}),
+            ("deleted holds a list", {"files": {"a.txt": ok, "b.txt": ok}, "deleted": [["a.txt"]]}),
+            ("errors is a number", {"files": {"a.txt": ok, "b.txt": ok}, "deleted": [], "errors": 5}),
+        ):
+            list_resp = json.dumps({"files": [{"path": p, "status": "M"} for p in ("a.txt", "b.txt")]}).encode()
+            fetch_resp = mik.base64.b64encode(json.dumps(payload).encode())
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as d:
+                self._setup(d)
+                with (
+                    mock.patch.object(
+                        mik, "_run_remote_script", side_effect=[(0, b"", list_resp), (0, b"", fetch_resp)]
+                    ),
+                    mock.patch("builtins.input", return_value="y"),
+                    mock.patch("builtins.print") as printed,
+                ):
+                    with self.assertRaises(mik.MikException):  # said in a line, not a traceback
+                        mik.dev_fetch_pod(SimpleNamespace(instance="inst"))
+                self.assertEqual(os.listdir(d), [])
+                shown = "".join(str(c.args[0]) for c in printed.call_args_list if c.args)
+                self.assertNotIn("\033[2J", shown)
+
+    def test_stderr_from_the_pod_cannot_carry_escape_sequences(self):
+        # `docker exec ... python3`: the python3 that answers is the pod's own, and so is what it writes.
+        with tempfile.TemporaryDirectory() as d:
+            self._setup(d)
+            with mock.patch.object(
+                mik, "_run_remote_script", side_effect=[(1, b"boom \033[2J\033[H\nline 2\r\xff", b"")]
+            ):
+                with self.assertRaises(mik.MikException) as ctx:
+                    mik.dev_fetch_pod(SimpleNamespace(instance="inst"))
+        self.assertEqual(str(ctx.exception), "SSH failed: boom [2J[H\nline 2\n�")
+
     def test_remote_warnings_cannot_carry_escape_sequences(self):
         list_resp = json.dumps({"files": [], "errors": ["invalid path: a\033[2Kb"]}).encode()
         with tempfile.TemporaryDirectory() as d:
@@ -447,6 +523,110 @@ class DevFetchPodTests(unittest.TestCase):
             ):
                 mik.dev_fetch_pod(SimpleNamespace(instance="inst"))
         self.assertIn("\033[90m  warning: invalid path: a[2Kb\033[39m", [c.args[0] for c in printed.call_args_list])
+
+
+@unittest.skipUnless(shutil.which("git"), "needs git")
+class RemoteListScriptTests(unittest.TestCase):
+    """The listing script that runs in the pod, run here as it is, on a real repository."""
+
+    def _git(self, repo, *argv):
+        base = ["git", "-C", str(repo), "-c", "user.email=t@example.invalid", "-c", "user.name=t"]
+        subprocess.run([*base, "-c", "commit.gpgsign=false", *argv], check=True, capture_output=True)
+
+    def _list(self, repo):
+        script = mik.REMOTE_SCRIPT_LIST.format(validate_path=mik._REMOTE_VALIDATE_PATH, code_dir=str(repo))
+        out = subprocess.run([sys.executable, "-c", script], check=True, capture_output=True, text=True).stdout
+        data = json.loads(out)
+        return {f["path"]: f["status"] for f in data["files"]}, data["errors"]
+
+    def _repo(self, d):
+        repo = Path(d) / "repo"
+        repo.mkdir()
+        self._git(repo, "init", "-q")
+        (repo / ".gitignore").write_text("secret.env\nbuild/\n")
+        (repo / "old.py").write_text("a\n")
+        (repo / "kept.py").write_text("a\n")
+        self._git(repo, "add", ".")
+        self._git(repo, "commit", "-q", "-m", "init")
+        return repo
+
+    def test_what_is_ignored_stays_out_of_a_new_directory(self):
+        with tempfile.TemporaryDirectory() as d:
+            repo = self._repo(d)
+            (repo / "newdir" / "build").mkdir(parents=True)
+            (repo / "newdir" / "keep.py").write_text("x\n")
+            (repo / "newdir" / "secret.env").write_text("s\n")
+            (repo / "newdir" / "build" / "out.bin").write_text("o\n")
+            (repo / "kept.py").write_text("b\n")
+            files, errors = self._list(repo)
+        self.assertEqual(files, {"newdir/keep.py": "A", "kept.py": "M"})
+        self.assertEqual(errors, [])
+
+    def test_a_rename_is_a_deletion_and_a_new_file_staged_or_not(self):
+        for staged in (True, False):
+            with self.subTest(staged=staged), tempfile.TemporaryDirectory() as d:
+                repo = self._repo(d)
+                if staged:
+                    self._git(repo, "mv", "old.py", "new.py")
+                else:
+                    (repo / "old.py").rename(repo / "new.py")
+                files, errors = self._list(repo)
+                self.assertEqual(files, {"old.py": "D", "new.py": "A"})
+                self.assertEqual(errors, [])
+
+    def test_a_symlink_and_a_repository_inside_are_left_out_with_a_warning(self):
+        with tempfile.TemporaryDirectory() as d:
+            repo = self._repo(d)
+            (repo / "newdir" / "sub").mkdir(parents=True)
+            (repo / "newdir" / "keep.py").write_text("x\n")
+            (repo / "newdir" / "link").symlink_to("/etc/passwd")
+            self._git(repo / "newdir" / "sub", "init", "-q")
+            (repo / "newdir" / "sub" / "f.py").write_text("y\n")
+            files, errors = self._list(repo)
+        self.assertEqual(files, {"newdir/keep.py": "A"})
+        self.assertEqual(sorted(errors), ["invalid path: newdir/sub/", "symlink rejected: newdir/link"])
+
+
+class ConfigNameCollisionTests(unittest.TestCase):
+    """The config is exec'd into mik's namespace: it must not get to replace what mik runs."""
+
+    def _load(self, config):
+        with tempfile.TemporaryDirectory() as d:
+            (Path(d) / "config.py").write_text(config)
+            with mock.patch.object(mik, "CONFIG_FILE", Path(d) / "config.py"):
+                mik.load_config()
+
+    def test_a_name_of_mik_defined_again_is_refused_naming_it(self):
+        for config, taken in (
+            ("def build(target):\n    pass\n", "build"),
+            ("debug = True\n", "debug"),
+            ("class Color:\n    pass\n", "Color"),
+            ("def deploy():\n    pass\n\n\ndef pop(cmd):\n    pass\n", "deploy, pop"),
+        ):
+            with self.subTest(taken=taken), contextlib.ExitStack() as stack:
+                for name in taken.split(", "):  # put mik's own back, whatever the config did to it
+                    stack.enter_context(mock.patch.object(mik, name, getattr(mik, name)))
+                with self.assertRaises(mik.MikException) as ctx:
+                    self._load(config)
+                self.assertTrue(str(ctx.exception).startswith(f"The config file defines {taken}: "))
+
+    def test_settings_helpers_of_its_own_and_the_same_imports_are_fine(self):
+        config = (
+            "import os\nimport subprocess\nfrom pathlib import Path\nfrom datetime import datetime\n"
+            'ROOT_CA_FILE = "/tmp/ca.pem"\nGITHUB_COM_CERT_SHA256 = ["ab" * 32]\n'
+            'ARTIFACTS_DIR = Path("/tmp/artifacts")\n'
+            "def my_collision_test_helper():\n    return run_step\n"
+        )
+        self.addCleanup(lambda: vars(mik).pop("my_collision_test_helper", None))
+        with (
+            mock.patch.object(mik, "ROOT_CA_FILE", None),
+            mock.patch.object(mik, "GITHUB_COM_CERT_SHA256", None),
+            mock.patch.object(mik, "ARTIFACTS_DIR", mik.ARTIFACTS_DIR),
+        ):
+            self._load(config)
+            self.assertEqual(mik.ROOT_CA_FILE, "/tmp/ca.pem")
+            self.assertEqual(mik.ARTIFACTS_DIR, Path("/tmp/artifacts"))
+            self.assertIs(mik.my_collision_test_helper(), mik.run_step)
 
 
 class DuplicateNameTests(unittest.TestCase):
@@ -802,6 +982,10 @@ class DeployReleaseTests(unittest.TestCase):
     def _idx(cmds, sub):
         return next(i for i, c in enumerate(cmds) if sub in c)
 
+    def _ready(self, cmds):
+        """The command that gets the upload ready beside what is served (and makes the merge)."""
+        return cmds[self._idx(cmds, f"chmod -R a+rX {self.S}/releasing/123")]
+
     # Three releases on the remote: two from before the last day (only the newer of them was still live
     # when the day began) and one from within it.
     HISTORY = [("100", 9 * DAY), ("105", 2 * DAY), ("110", DAY // 2)]
@@ -818,15 +1002,19 @@ class DeployReleaseTests(unittest.TestCase):
         self.assertIn("readlink current", cmds[look])
         self.assertIn("find releases merged releasing merging -mindepth 1 -maxdepth 1", cmds[look])
         self.assertIn("-printf '%h %y %T@ %f\\n'", cmds[look])
+        # what is about to be merged is listed before anything is uploaded: 105 and 110, not 100
+        held = self._idx(cmds, "-printf '%y %p\\0'")
+        self.assertEqual(cmds[held], f"ssh user@host cd {self.R} && find 105 110 -mindepth 1 -printf '%y %p\\0'")
         scp = self._idx(cmds, "scp -r")
         # ships the artifact dir itself, no local copy, into releasing/ — not yet a release
         self.assertEqual(cmds[scp], f"scp -r {src} user@host:{self.S}/releasing/123")
         ready = self._idx(cmds, f"mkdir {self.S}/merging/123")
         live = self._idx(cmds, "ln -sfn merged/123")
         cleanup = self._idx(cmds, f"rm -rf {self.M}/105")
-        # strict ordering: look -> ship -> get ready -> go live -> delete leftovers, and nothing else
-        self.assertEqual([look, scp, ready, live, cleanup], [0, 1, 2, 3, 4])
-        self.assertEqual(len(cmds), 5)
+        # strict ordering: look -> what is to be merged -> ship -> get ready -> go live -> delete leftovers,
+        # and nothing else
+        self.assertEqual([look, held, scp, ready, live, cleanup], [0, 1, 2, 3, 4, 5])
+        self.assertEqual(len(cmds), 6)
 
         # getting ready: the upload made world-readable, then the merge — the release that was live when the
         # day began, the one from within the day, and the new one LAST so it wins on shared names. 100 was
@@ -893,12 +1081,12 @@ class DeployReleaseTests(unittest.TestCase):
         # something in 100 would disappear. 100 is not merged again, and goes — keep=5 or not.
         history = [("100", 3 * self.DAY), ("105", 3600)]
         _, cmds, _, _ = self._deploy(self._survey("releases/105", history))
-        self.assertNotIn(f"{self.R}/100/", cmds[2])
-        self.assertIn(f"cp -rL {self.R}/105/. {self.S}/merging/123/", cmds[2])
+        self.assertNotIn(f"{self.R}/100/", self._ready(cmds))
+        self.assertIn(f"cp -rL {self.R}/105/. {self.S}/merging/123/", self._ready(cmds))
         self.assertEqual(cmds[-1], f"ssh user@host rm -rf {self.R}/100")
         # the same when 100 is recent enough to be within the day
         _, cmds, _, _ = self._deploy(self._survey("releases/105", [("100", 7200), ("105", 3600)]))
-        self.assertNotIn(f"{self.R}/100/", cmds[2])
+        self.assertNotIn(f"{self.R}/100/", self._ready(cmds))
         self.assertEqual(cmds[-1], f"ssh user@host rm -rf {self.R}/100")
         # a deploy that does not merge either forgets nothing: `keep` decides, as ever
         _, cmds, _, _ = self._deploy(self._survey("releases/105", history), merge_seconds=0)
@@ -920,8 +1108,9 @@ class DeployReleaseTests(unittest.TestCase):
         went = cmds[self._idx(cmds, "ln -sfn merged/123")]
         for done, doing in ((self.R, "releasing"), (self.M, "merging")):
             self.assertLess(went.index(f"rm -rf {done}/123"), went.index(f"mv -T {self.S}/{doing}/123 {done}/123"))
-        self.assertNotIn(f"{self.R}/123/.", cmds[2])  # merged from the new upload, not from its older copy
-        self.assertFalse(any(f"rm -rf {self.R}/123" in c or f"rm -rf {self.M}/123" in c for c in cmds[4:]))
+        self.assertNotIn(f"{self.R}/123/.", self._ready(cmds))  # merged from the new upload, not its older copy
+        after = cmds[self._idx(cmds, "ln -sfn merged/123") + 1 :]
+        self.assertFalse(any(f"rm -rf {self.R}/123" in c or f"rm -rf {self.M}/123" in c for c in after))
 
     def test_an_unfinished_deploy_is_shown_and_deleted_only_once_agreed(self):
         left = ["releasing/120", "merging/120"]
@@ -929,7 +1118,8 @@ class DeployReleaseTests(unittest.TestCase):
         # agreed: deleted before anything is uploaded, then the deploy goes on
         _, cmds, printed, _ = self._deploy(survey, answer=["y"])
         self.assertEqual(cmds[1], f"ssh user@host rm -rf {self.S}/releasing/120 {self.S}/merging/120")
-        self.assertIn("scp -r", cmds[2])
+        self.assertIn("find 105 110", cmds[2])
+        self.assertIn("scp -r", cmds[3])
         self.assertTrue(any("did not finish" in line for line in printed))
         self.assertTrue(all(any(path in line for line in printed) for path in left))
         self.assertTrue(any("deployed site" in line for line in printed))
@@ -954,6 +1144,67 @@ class DeployReleaseTests(unittest.TestCase):
         # the release being shipped is never merged under itself, even if an older copy of it is listed
         self.assertEqual(pick([("123", 3 * self.DAY), ("110", 100)]), ["110"])
         self.assertEqual(pick(self.HISTORY, seconds=0), [])
+
+    def test_merge_clashes(self):
+        one = {"index.html": "f", "docs": "f", "assets": "d", "assets/a.js": "f"}
+        two = {"index.html": "f", "docs": "d", "docs/index.html": "f", "assets": "d", "assets/b.js": "f"}
+        self.assertEqual(mik._merge_clashes([("1", one), ("2", dict(one))]), [])
+        # only the name where the two part, not what is under it; and once, however many releases follow
+        self.assertEqual(mik._merge_clashes([("1", one), ("2", two)]), [("docs", "1", "f", "2", "d")])
+        self.assertEqual(mik._merge_clashes([("1", one), ("2", two), ("3", one)]), [("docs", "1", "f", "2", "d")])
+        self.assertEqual(mik._merge_clashes([("1", two), ("2", one)]), [("docs", "1", "d", "2", "f")])
+
+    def test_what_the_releases_hold_is_read_strictly(self):
+        out = b"d 105/assets\0f 105/assets/a b.js\0f 105/new\nline.js\0f 110/index.html\0"
+        self.assertEqual(
+            mik._parse_release_kinds(out, ["105", "110"]),
+            {"105": {"assets": "d", "assets/a b.js": "f", "new\nline.js": "f"}, "110": {"index.html": "f"}},
+        )
+        self.assertEqual(mik._parse_release_kinds(b"", ["105"]), {"105": {}})  # an empty release
+        for stray, said in (
+            (b"l 105/leak.txt\0", "unexpected in the remote release 105: 'leak.txt'"),  # a symlink
+            (b"p 105/\033[2Jpipe\0", "unexpected in the remote release 105: '[2Jpipe'"),  # and nothing printed raw
+            (b"f 999/index.html\0", "could not read"),  # a release that was not asked about
+            (b"find: something went wrong\0", "could not read"),
+        ):
+            with self.assertRaises(mik.MikException, msg=stray) as cm:
+                mik._parse_release_kinds(out + stray, ["105", "110"])
+            self.assertIn(said, str(cm.exception))
+
+    def test_a_clash_stops_before_the_upload_and_names_the_way_out(self):
+        survey = self._survey("merged/110", self.HISTORY, merged=["110"])
+
+        def step(cmda, *a, **k):
+            said = " ".join(cmda)
+            if "find 105 110" in said:  # 110 has `bundle.YYY.js` as a directory; the artifact, as a file
+                return b"f 105/index.html\0d 110/bundle.YYY.js\0f 110/bundle.YYY.js/part.js\0"
+            return survey if "echo now" in said else b""
+
+        with self.assertRaises(mik.MikException) as cm:
+            self._deploy(survey, run_step=step)
+        self.assertIn("  bundle.YYY.js: a directory in 110, a file in 123\n", str(cm.exception))
+        self.assertIn("Deploy site once with merge_seconds=0", str(cm.exception))
+        self.assertEqual(len(self.cmds), 2)  # the two looks, and nothing after them
+        self.assertFalse(any("scp" in c for c in self.cmds))
+
+    def test_names_in_the_listing_are_not_printed_as_they_came(self):
+        # The remote is the one writing the listing: a name in it may be made to rewrite the terminal, or to
+        # look like more lines of output. It is only compared, and shown without what is not printable.
+        survey = self._survey("merged/110", self.HISTORY, merged=["110"])
+        evil = b"\033[2J\033[Hfake\ndeployed site -> ok\xff"
+
+        def step(cmda, *a, **k):
+            said = " ".join(cmda)
+            if "find 105 110" in said:
+                return b"f 105/" + evil + b"\0d 110/" + evil + b"\0"
+            return survey if "echo now" in said else b""
+
+        with self.assertRaises(mik.MikException) as cm:
+            self._deploy(survey, run_step=step)
+        self.assertIn("\n  [2J[Hfakedeployed site -> ok: a file in 105, a directory in 110\n", str(cm.exception))
+        self.assertNotIn("\033", str(cm.exception))
+        self.assertEqual(len(str(cm.exception).split("\n")), 3)  # the three lines mik wrote, no line of its own
+        str(cm.exception).encode()  # and nothing that could not be printed at all
 
     def test_survey_is_read_strictly(self):
         out = (
@@ -1204,6 +1455,52 @@ class DeployReleaseOnDiskTests(unittest.TestCase):
         self.assertEqual(self._served(), {"index.html": "one"})
         self.assertEqual(self._there("releasing"), [])  # stopped before the upload
 
+    def test_a_file_here_and_a_directory_there_is_refused_before_the_upload(self):
+        # cp replaces neither with the other: the merge would fail, at every try, for as long as both
+        # releases are in the window. Said before anything is uploaded, with the way out.
+        for one, two, said in (
+            ({"docs": "a page"}, {"docs/index.html": "a directory now"}, "  docs: a file in 1, a directory in 2\n"),
+            ({"docs/index.html": "a directory"}, {"docs": "a page now"}, "  docs: a directory in 1, a file in 2\n"),
+        ):
+            with self.subTest(said=said):
+                shutil.rmtree(self.site)
+                self.site.mkdir()
+                self._ship("1", {"index.html": "one", **one})
+                for _ in range(2):  # and again: nothing was left behind to be asked about
+                    with self.assertRaises(mik.MikException) as cm:
+                        self._ship("2", {"index.html": "two", **two})
+                    self.assertIn(said, str(cm.exception))
+                    self.assertIn("Nothing was uploaded", str(cm.exception))
+                    self.assertIn("merge_seconds=0", str(cm.exception))
+                    self.assertEqual(self._served(), {"index.html": "one", **one})
+                    self.assertEqual((self._there("releasing"), self._there("merging")), ([], []))
+                    self.assertEqual(self._there("releases"), ["1"])
+                # the way out it names: served alone once, and history begins again there
+                self._ship("2", {"index.html": "two", **two}, merge_seconds=0)
+                self.assertEqual(self._served(), {"index.html": "two", **two})
+                self._ship("3", {"index.html": "three", "a.3.js": "a3"})
+                self.assertEqual(self._served(), {"index.html": "three", "a.3.js": "a3", **two})
+
+    def test_file_names_that_would_mean_something_to_a_shell_are_only_names(self):
+        odd = ['a"; touch PWNED #.js', "$(touch PWNED).js", "`touch PWNED`.js", "-rf", "new\nline.js", "a b/c d.js"]
+        self._ship("1", {"index.html": "one", **{name: "x" for name in odd}})
+        self._ship("2", {"index.html": "two"})  # listed, compared and merged, the names never in a command
+        self.assertEqual(self._served(), {"index.html": "two", **{name: "x" for name in odd}})
+        self.assertEqual([p for p in self.tmp.rglob("PWNED")], [])
+        self.assertFalse(Path("PWNED").exists())
+
+    def test_a_symlink_put_in_a_release_on_the_remote_is_not_merged(self):
+        # mik uploads regular files and directories. `cp -rL` would follow the link and copy what it leads
+        # to into what is served.
+        (self.tmp / "secret").write_text("not for the web")
+        self._ship("1", {"index.html": "one"})
+        (self.site / "releases" / "1" / "leak.txt").symlink_to(self.tmp / "secret")
+        with self.assertRaises(mik.MikException) as cm:
+            self._ship("2", {"index.html": "two"})
+        self.assertIn("unexpected in the remote release 1: 'leak.txt'", str(cm.exception))
+        self.assertEqual(self._served(), {"index.html": "one"})
+        self.assertEqual(self._there("releasing"), [])  # stopped before the upload
+
 
 class FilterParamTests(unittest.TestCase):
     """The `key=NAME` filters of the list-* commands, through main(): a bad one is a usage error."""
@@ -1252,6 +1549,16 @@ class CliTests(unittest.TestCase):
             with mock.patch("builtins.print") as printed:
                 self.assertEqual(mik.cli(), 1)
         self.assertEqual(_printed(printed), ["\n  !!  nope  !!  \n"])
+        # red is put on here, once, and the line goes to stderr: stdout stays what the command printed
+        self.assertEqual(printed.call_args.args[0], "\033[31m\n  !!  nope  !!  \n\033[39m")
+        self.assertIs(printed.call_args.kwargs["file"], sys.stderr)
+
+    def test_no_error_message_carries_its_own_colour(self):
+        mik.instances_dict.clear()
+        for command in (mik.deploy, mik.build, mik.dev_fetch_pod):
+            with self.subTest(command=command.__name__), self.assertRaises(mik.MikException) as ctx:
+                command(SimpleNamespace(instance="nope"))
+            self.assertEqual(str(ctx.exception), "Instance not found")
 
     def test_keyboard_interrupt_is_exit_130(self):
         with mock.patch.object(mik, "main", side_effect=KeyboardInterrupt), mock.patch("builtins.print"):

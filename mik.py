@@ -154,8 +154,6 @@ class Instance(metaclass=InstanceMeta):
     code_dir: Optional[str] = None  # path inside the container
     deploy: Optional[list] = None  # shell commands (joined, run locally) — or override with a classmethod
     deploy_shell: Optional[str] = None  # optional; defaults to /bin/bash
-    get_remote_source: Optional[list] = None  # optional legacy script
-    get_remote_source_shell: Optional[str] = None
 
 
 projects_dict = {}
@@ -268,12 +266,12 @@ def list_instances(args):
     project_filter = getattr(args, "project", None)
     if project_filter:
         if project_filter not in projects_dict:
-            raise MikException(f"{Color.RED.value}Project not found: {project_filter}{Color.WHITE.value}")
+            raise MikException(f"Project not found: {project_filter}")
         names = [n for n in names if n in set(instances_for_project(project_filter))]
     machine_filter = getattr(args, "machine", None)
     if machine_filter:
         if machine_filter not in machines_dict:
-            raise MikException(f"{Color.RED.value}Machine not found: {machine_filter}{Color.WHITE.value}")
+            raise MikException(f"Machine not found: {machine_filter}")
         names = [n for n in names if n in set(instances_for_machine(machine_filter))]
     if getattr(args, "show_links", False):
         _print_instance_section("INSTANCES", names)
@@ -291,7 +289,7 @@ def list_projects(args):
     machine_filter = getattr(args, "machine", None)
     if machine_filter:
         if machine_filter not in machines_dict:
-            raise MikException(f"{Color.RED.value}Machine not found: {machine_filter}{Color.WHITE.value}")
+            raise MikException(f"Machine not found: {machine_filter}")
         names = [n for n in names if n in set(projects_for_machine(machine_filter))]
     if getattr(args, "show_instances", False):
         _print_relation_section("PROJECTS", names, instances_for_project)
@@ -309,7 +307,7 @@ def list_machines(args):
     project_filter = getattr(args, "project", None)
     if project_filter:
         if project_filter not in projects_dict:
-            raise MikException(f"{Color.RED.value}Project not found: {project_filter}{Color.WHITE.value}")
+            raise MikException(f"Project not found: {project_filter}")
         running = {
             getattr(i, "machine", None)
             for i in instances_dict.values()
@@ -344,7 +342,7 @@ def deploy(args):
     instance_name = args.instance
     inst = instances_dict.get(instance_name)
     if not inst:
-        raise MikException(f"{Color.RED.value}Instance not found{Color.WHITE.value}")
+        raise MikException("Instance not found")
     d = getattr(inst, "deploy", None)
     if callable(d):
         # Custom Python deploy (a classmethod on the Instance) — it runs and reports itself.
@@ -353,15 +351,13 @@ def deploy(args):
         return d(release_id) if release_id is not None else d()
     release_id = getattr(args, "release_id", None)
     if release_id is not None:
-        raise MikException(
-            f"{Color.RED.value}{instance_name} has a script deploy; RELEASE_ID not supported{Color.WHITE.value}"
-        )
+        raise MikException(f"{instance_name} has a script deploy; RELEASE_ID not supported")
     if not d:
-        raise MikException(f"{Color.RED.value}Instance has no deploy script{Color.WHITE.value}")
+        raise MikException("Instance has no deploy script")
     s = "\n".join(d)
     rc, _ = run_recorded("deploy", instance_name, s, getattr(inst, "deploy_shell", None) or "/bin/bash")
     if rc != 0:
-        raise MikException(f"{Color.RED.value}deploy failed (rc={rc}){Color.WHITE.value}")
+        raise MikException(f"deploy failed (rc={rc})")
 
 
 def build(args):
@@ -369,27 +365,11 @@ def build(args):
     instance_name = args.instance
     inst = instances_dict.get(instance_name)
     if not inst:
-        raise MikException(f"{Color.RED.value}Instance not found{Color.WHITE.value}")
+        raise MikException("Instance not found")
     b = getattr(inst, "build", None)
     if not callable(b):
-        raise MikException(f"{Color.RED.value}Instance has no build step{Color.WHITE.value}")
+        raise MikException("Instance has no build step")
     return b()
-
-
-def get_remote_source(args):
-    instance_name = args.instance
-    inst = instances_dict.get(instance_name)
-    if not inst:
-        raise MikException(f"{Color.RED.value}Instance not found{Color.WHITE.value}")
-    d = getattr(inst, "get_remote_source", None)
-    if not d:
-        raise MikException(f"{Color.RED.value}Instance has no get_remote_source script{Color.WHITE.value}")
-    s = "\n".join(d)
-    rc, _ = run_recorded(
-        "get-remote-source", instance_name, s, getattr(inst, "get_remote_source_shell", None) or "/bin/bash"
-    )
-    if rc != 0:
-        raise MikException(f"{Color.RED.value}get-remote-source failed (rc={rc}){Color.WHITE.value}")
 
 
 def run_and_capture(script, executable="/bin/bash"):
@@ -457,8 +437,8 @@ def record_run(command, target, started_at, finished_at, returncode, output):
 def run_recorded(command, target, script, executable):
     """Run a shell script via run_and_capture and persist the result via record_run.
 
-    Returns (returncode, output). Shared by deploy / get-remote-source so both stream live and leave
-    an investigable trail under RUNS_DIR.
+    Returns (returncode, output). What a script deploy goes through: it streams live and leaves an
+    investigable trail under RUNS_DIR.
     """
     started = datetime.now().astimezone()
     rc, output = run_and_capture(script, executable)
@@ -626,14 +606,16 @@ def run_step(cmda, fail_on_stderr=False):
 
     Returns captured stdout. fail_on_stderr defaults to False because ssh/scp/git routinely write to
     stderr on success; pass True for commands you expect to stay silent. The failing command is included
-    in the error, so config deploys stay locatable without a custom message per step.
+    in the error, so config deploys stay locatable without a custom message per step. What the command
+    wrote on stderr is in the error too, through _printable_lines: for an ssh step it is the remote that
+    wrote it, and it must not get to send escape sequences to the terminal.
     """
     c, e, r = pop(cmda)
     debug(f"step rc={c} cmd={cmda} err={e!r} out={r!r}")
     if c != 0:
-        raise MikException(f"step failed (rc={c}): {' '.join(cmda)}\n{e.decode(errors='replace')}")
+        raise MikException(f"step failed (rc={c}): {' '.join(cmda)}\n{_printable_lines(e)}")
     if fail_on_stderr and e:
-        raise MikException(f"step wrote to stderr: {' '.join(cmda)}\n{e.decode(errors='replace')}")
+        raise MikException(f"step wrote to stderr: {' '.join(cmda)}\n{_printable_lines(e)}")
     return r
 
 
@@ -826,6 +808,57 @@ def _site_leftovers(releases, merged, rid, serving, merging, keep):
     )
 
 
+def _tree_kinds(src):
+    """{path: "d" or "f"} for everything under a local artifact directory, paths relative to it."""
+    kinds = {}
+    for root, dirs, files in os.walk(str(src), followlinks=False):
+        for names, kind in ((dirs, "d"), (files, "f")):
+            for entry in names:
+                kinds[os.path.relpath(os.path.join(root, entry), str(src))] = kind
+    return kinds
+
+
+def _parse_release_kinds(out, entries):
+    """{release: {path: "d" or "f"}} for the releases about to be merged, from what the remote `find` printed.
+
+    One `kind release/path` per file or directory, ended by a NUL: a file name may hold anything else, a
+    newline included, and none of these names goes into a command — they are only compared. A release holds
+    what scp put there, regular files and directories; anything else in one (a symlink, which `cp -rL` would
+    follow to copy what it leads to into the web root) was not put there by mik, and stops the deploy.
+    """
+    kinds = {entry: {} for entry in entries}
+    for record in out.split(b"\0"):
+        if not record:
+            continue
+        kind, _, path = os.fsdecode(record).partition(" ")
+        entry, _, inside = path.partition("/")
+        if entry not in kinds or not inside:
+            raise MikException(f"could not read what the remote releases hold: {_printable(path)!r}")
+        if kind not in ("d", "f"):
+            raise MikException(
+                f"unexpected in the remote release {entry}: {_printable(inside)!r} is neither a regular file nor "
+                f"a directory. mik uploads nothing else. Move it away, then deploy again."
+            )
+        kinds[entry][inside] = kind
+    return kinds
+
+
+def _merge_clashes(layers):
+    """What stops `layers` from being copied over one another: [(path, release, kind, other release, its kind)].
+
+    `layers` is [(release, {path: kind})], in the order they are merged. `cp -r` copies a file over a file
+    and a directory into a directory; a name that is a file in one release and a directory in another it
+    replaces in neither direction — it fails. Only the name where the two part is listed, not what is under.
+    """
+    first, clashes = {}, {}
+    for entry, kinds in layers:
+        for path, kind in kinds.items():
+            was_kind, was_entry = first.setdefault(path, (kind, entry))
+            if was_kind != kind:
+                clashes.setdefault(path, (path, was_entry, was_kind, entry, kind))
+    return [clashes[path] for path in sorted(clashes)]
+
+
 def deploy_release(src, ssh_host, site_root, release_id, name, keep=5, merge_seconds=86400):
     """Zero-downtime deploy of an already-built artifact. No rsync, no shell pipes, no sudo.
 
@@ -875,6 +908,12 @@ def deploy_release(src, ssh_host, site_root, release_id, name, keep=5, merge_sec
     than on every request, is still reading from it for that long. It goes at the next deploy. One
     exception: shipping again the id that is live right now replaces that directory under its name, and
     requests get 404s while that takes.
+
+    What cannot be merged. A name that is a file in one release and a directory in another (`docs`, then
+    `docs/index.html`): cp replaces neither with the other. This is looked for before anything is uploaded
+    — the releases about to be merged are listed and compared with the artifact — and the deploy is refused,
+    naming them. Retrying would not help while both releases are in the window: deploy once with
+    merge_seconds=0, and history begins again at that release (see above).
 
     When a deploy fails. Any step may: run it again. What a failed one left in releasing/ or merging/ is
     shown and, once you agree, deleted (the same would show if another deploy were running right now —
@@ -945,15 +984,38 @@ def deploy_release(src, ssh_host, site_root, release_id, name, keep=5, merge_sec
         if answer.strip().lower() != "y":
             raise MikException(f"not deploying {name}: unfinished deploy left in {site_root} ({', '.join(unfinished)})")
         run_step(["ssh", ssh_host, "rm -rf " + " ".join(f"{site_root}/{path}" for path in unfinished)])
-    # 3. ship the built artifact as-is (scp = argv, no shell). releasing/ is empty by now, so the directory
-    #    scp makes is the artifact itself.
-    run_step(["scp", "-r", str(src), f"{ssh_host}:{releasing_dir}/{rid}"])
-    # 4. get ready, beside what is served: the upload made world-readable (a containerized server reads by
-    #    'other' bits) and, when merging, the merge — the earlier releases copied in from oldest to newest and
-    #    this one last, so that it wins on shared names.
+    # 3. what is to be merged, and whether it can be: the earlier releases are listed (read-only) and
+    #    compared, here, with one another and with the artifact. A clash would make the merge fail at every
+    #    try, so it is refused now, while nothing has been uploaded.
     forgotten = _forgotten_releases(releases, rid, serving) if merge_seconds > 0 else []
     remembered = [(when, entry) for when, entry in releases if entry not in forgotten]
     merging = _releases_to_merge(remembered, rid, now, merge_seconds)
+    if merging:
+        listing = run_step(
+            ["ssh", ssh_host, f"cd {releases_dir} && find {' '.join(merging)} -mindepth 1 -printf '%y %p\\0'"]
+        )
+        held = _parse_release_kinds(listing, merging)
+        clashes = _merge_clashes([*[(entry, held[entry]) for entry in merging], (rid, _tree_kinds(src))])
+        if clashes:
+            said = {"d": "a directory", "f": "a file"}
+            lines = [
+                f"  {_printable(path)}: {said[was]} in {entry}, {said[kind]} in {other}"
+                for path, entry, was, other, kind in clashes[:10]
+            ]
+            if len(clashes) > 10:
+                lines.append(f"  ... and {len(clashes) - 10} more")
+            raise MikException(
+                f"cannot merge release {rid} with the earlier ones (cp replaces neither a file with a directory "
+                f"nor a directory with a file):\n" + "\n".join(lines) + "\n"
+                f"Nothing was uploaded. Deploy {name} once with merge_seconds=0: this release is then served "
+                f"alone (a page loaded before it may miss its old bundles), and later deploys merge from it on."
+            )
+    # 4. ship the built artifact as-is (scp = argv, no shell). releasing/ is empty by now, so the directory
+    #    scp makes is the artifact itself.
+    run_step(["scp", "-r", str(src), f"{ssh_host}:{releasing_dir}/{rid}"])
+    # 5. get ready, beside what is served: the upload made world-readable (a containerized server reads by
+    #    'other' bits) and, when merging, the merge — the earlier releases copied in from oldest to newest and
+    #    this one last, so that it wins on shared names.
     ready = [f"chmod -R a+rX {releasing_dir}/{rid}"]
     go_live = [f"rm -rf {releases_dir}/{rid}", f"mv -T {releasing_dir}/{rid} {releases_dir}/{rid}"]
     target = f"releases/{rid}"
@@ -967,11 +1029,11 @@ def deploy_release(src, ssh_host, site_root, release_id, name, keep=5, merge_sec
         go_live += [f"rm -rf {merged_dir}/{rid}", f"mv -T {merging_dir}/{rid} {merged_dir}/{rid}"]
         target = f"merged/{rid}"
     run_step(["ssh", ssh_host, " && ".join(ready)])
-    # 5. go live, in one command: each directory takes its name (a rename; the `rm -rf` only finds something
+    # 6. go live, in one command: each directory takes its name (a rename; the `rm -rf` only finds something
     #    when this id was shipped before) and `current` flips to it (atomic rename, never absent). A release
     #    is named in releases/ here and nowhere else — that is what "it is in releases/" tells the next deploy.
     run_step(["ssh", ssh_host, " && ".join([*go_live, _flip_current_cmd(site_root, target)])])
-    # 6. delete what nothing needs any more — never what was being served until a moment ago (best-effort;
+    # 7. delete what nothing needs any more — never what was being served until a moment ago (best-effort;
     #    failure here must not fail the deploy)
     old_releases, old_merged = _site_leftovers(remembered, merged, rid, serving, merging, keep)
     doomed = [f"{releases_dir}/{entry}" for entry in [*forgotten, *old_releases]]
@@ -1014,11 +1076,20 @@ def validate_path(p):
     return True
 """
 
+# git does the listing, one file per line, so that what is ignored stays out:
+#   -uall          every untracked file by its own path. Without it a new directory is one line ("?? dir/")
+#                  and finding what is in it would be up to us — a walk, that knows nothing of .gitignore.
+#   --no-renames   a rename that was staged in the pod ("R  old -> new", two paths in one line) comes as what
+#                  it is to us: "D  old" and "A  new". One that was not staged already does (" D" and "??").
+# What is left with a "/" at the end is a repository inside the repository: git does not look into it, and
+# neither do we (validate_path refuses the name, it is shown as a warning).
 REMOTE_SCRIPT_LIST = """
 import subprocess, json, os, sys
 {validate_path}
 code_dir = {code_dir!r}
-r = subprocess.run(["git", "-C", code_dir, "status", "--porcelain"], capture_output=True, text=True)
+r = subprocess.run(
+    ["git", "-C", code_dir, "status", "--porcelain", "-uall", "--no-renames"], capture_output=True, text=True
+)
 if r.returncode != 0:
     print(json.dumps({{"files": [], "errors": ["git status failed: " + r.stderr.strip()]}}))
     sys.exit(0)
@@ -1029,33 +1100,19 @@ for line in r.stdout.split("\\n"):
         continue
     status_code = line[:2]
     path = line[3:]
-    if status_code == "??" and path.endswith("/"):
-        full = os.path.join(code_dir, path)
-        for root, dirs, fnames in os.walk(full, followlinks=False):
-            for fn in fnames:
-                full_path = os.path.join(root, fn)
-                fp = os.path.relpath(full_path, code_dir)
-                if os.path.islink(full_path):
-                    errors.append("symlink rejected: " + fp)
-                elif not validate_path(fp):
-                    errors.append("invalid path: " + fp)
-                else:
-                    files.append({{"path": fp, "status": "A"}})
-            dirs[:] = [d for d in dirs if not os.path.islink(os.path.join(root, d))]
+    if "D" in status_code:
+        s = "D"
+    elif status_code == "??" or "A" in status_code:
+        s = "A"
     else:
-        if "D" in status_code:
-            s = "D"
-        elif status_code == "??":
-            s = "A"
-        else:
-            s = "M"
-        full_path = os.path.join(code_dir, path)
-        if s != "D" and os.path.islink(full_path):
-            errors.append("symlink rejected: " + path)
-        elif not validate_path(path):
-            errors.append("invalid path: " + path)
-        else:
-            files.append({{"path": path, "status": s}})
+        s = "M"
+    full_path = os.path.join(code_dir, path)
+    if s != "D" and os.path.islink(full_path):
+        errors.append("symlink rejected: " + path)
+    elif not validate_path(path):
+        errors.append("invalid path: " + path)
+    else:
+        files.append({{"path": path, "status": s}})
 print(json.dumps({{"files": files, "errors": errors}}))
 """
 
@@ -1094,12 +1151,64 @@ def _checked_remote_files(files):
     counts is this one, made here, before the list is shown and long before anything is written.
     """
     if not isinstance(files, list):
-        raise MikException(f"{Color.RED.value}Bad file list from remote{Color.WHITE.value}")
+        raise MikException("Bad file list from remote")
     for f in files:
         ok = isinstance(f, dict) and f.get("status") in ("M", "A", "D") and isinstance(f.get("path"), str)
         if not ok or not validate_path(f["path"]):
-            raise MikException(f"{Color.RED.value}Refusing the remote file list, bad entry: {f!r}{Color.WHITE.value}")
-    return files
+            raise MikException(f"Refusing the remote file list, bad entry: {f!r}")
+    # Made again from the two checked fields: this list goes back into the fetch script, and anything else a
+    # pod put beside them has no business travelling with it.
+    return [{"path": f["path"], "status": f["status"]} for f in files]
+
+
+def _checked_remote_contents(payload, files):
+    """What a pod sent for the confirmed `files`, as ({path: bytes}, [deleted paths]) — or refused as a whole.
+
+    The answer has to be exactly what was confirmed: the same paths, each one the way it was shown (content
+    for a modified or new file, a deletion for a deleted one), nothing more and nothing missing. Every content
+    is decoded here, so that an answer that is wrong somewhere is refused before the first file is written,
+    not found out halfway through.
+    """
+    contents, deleted, errors = None, None, None
+    if isinstance(payload, dict):
+        contents, deleted, errors = payload.get("files", {}), payload.get("deleted", []), payload.get("errors") or []
+    shaped = isinstance(contents, dict) and isinstance(deleted, list) and isinstance(errors, list)
+    if not shaped or not all(isinstance(fpath, str) for fpath in deleted):
+        raise MikException("Bad fetch response")
+    for err in errors:
+        print(f"{Color.DIM.value}  warning: {_printable(err)}{Color.WHITE.value}")
+    approved = {f["path"]: f["status"] for f in files}
+    problems, decoded = [], {}
+    for fpath, content in contents.items():
+        if fpath not in approved:
+            problems.append(f"unexpected path: {fpath}")
+        elif approved[fpath] == "D":
+            problems.append(f"was confirmed as deleted but got content: {fpath}")
+        else:
+            try:
+                decoded[fpath] = base64.b64decode(content, validate=True)
+            except (TypeError, ValueError):  # not a string, or not base64
+                problems.append(f"content is not base64: {fpath}")
+    for fpath in deleted:
+        if fpath not in approved:
+            problems.append(f"unexpected path: {fpath}")
+        elif approved[fpath] != "D":
+            problems.append(f"was confirmed as {approved[fpath]} but got deletion: {fpath}")
+    received = set(contents) | set(deleted)
+    for fpath, status in approved.items():
+        if fpath not in received:
+            problems.append(f"missing from response: {fpath} (was {status})")
+    if problems:
+        for p in problems:  # a path that was not confirmed was not checked either: it is not printed as it came
+            print(f"{Color.RED.value}  {_printable(p)}{Color.WHITE.value}")
+        raise MikException(f"{len(problems)} mismatch(es) with confirmed list, aborting")
+    return decoded, deleted
+
+
+def _printable_lines(raw):
+    """stderr of a command that ran on a remote or in a pod, made safe to print: its lines kept, each through
+    _printable."""
+    return "\n".join(_printable(line) for line in raw.decode(errors="replace").splitlines())
 
 
 def _run_remote_script(ssh_host, container, script):
@@ -1113,17 +1222,17 @@ def _run_remote_script(ssh_host, container, script):
 def dev_fetch_pod(args):
     inst = instances_dict.get(args.instance)
     if not inst:
-        raise MikException(f"{Color.RED.value}Instance not found{Color.WHITE.value}")
+        raise MikException("Instance not found")
     machine = machines_dict.get(getattr(inst, "machine", None))
     if not machine or not machine.ssh_host:
-        raise MikException(f"{Color.RED.value}Instance has no machine with an ssh_host{Color.WHITE.value}")
+        raise MikException("Instance has no machine with an ssh_host")
     project = projects_dict.get(getattr(inst, "project", None))
     if not project or not project.local_repo:
-        raise MikException(f"{Color.RED.value}Instance's project has no local_repo{Color.WHITE.value}")
+        raise MikException("Instance's project has no local_repo")
     container = inst.container
     code_dir = inst.code_dir
     if not container or not code_dir:
-        raise MikException(f"{Color.RED.value}Instance has no container/code_dir{Color.WHITE.value}")
+        raise MikException("Instance has no container/code_dir")
     local_repo = project.local_repo
     ssh_host = machine.ssh_host
     for part in ssh_host.split("@"):
@@ -1137,13 +1246,13 @@ def dev_fetch_pod(args):
     )
     c, e, r = _run_remote_script(ssh_host, container, script)
     if c != 0:
-        raise MikException(f"{Color.RED.value}SSH failed: {e.decode()}{Color.WHITE.value}")
+        raise MikException(f"SSH failed: {_printable_lines(e)}")
     try:
         data = json.loads(r.decode())
     except ValueError:  # not JSON, or not UTF-8
         data = None
     if not isinstance(data, dict):
-        raise MikException(f"{Color.RED.value}Bad response from remote: {r[:200]}{Color.WHITE.value}")
+        raise MikException(f"Bad response from remote: {r[:200]}")
     for err in data.get("errors") or []:
         print(f"{Color.DIM.value}  warning: {_printable(err)}{Color.WHITE.value}")
     files = _checked_remote_files(data.get("files", []))
@@ -1165,48 +1274,25 @@ def dev_fetch_pod(args):
     script = REMOTE_SCRIPT_FETCH.format(code_dir=code_dir, file_list=file_list_json)
     c, e, r = _run_remote_script(ssh_host, container, script)
     if c != 0:
-        raise MikException(f"{Color.RED.value}SSH fetch failed: {e.decode()}{Color.WHITE.value}")
+        raise MikException(f"SSH fetch failed: {_printable_lines(e)}")
     try:
         payload = json.loads(base64.b64decode(r.strip()))
     except Exception:
-        raise MikException(f"{Color.RED.value}Bad fetch response{Color.WHITE.value}")
-    for err in payload.get("errors") or []:
-        print(f"{Color.DIM.value}  warning: {_printable(err)}{Color.WHITE.value}")
-    # Preemptive check — reject entire response if paths or statuses don't match confirmed list
-    approved = {f["path"]: f["status"] for f in files}
-    problems = []
-    for fpath in payload.get("files", {}):
-        if fpath not in approved:
-            problems.append(f"unexpected path: {fpath}")
-        elif approved[fpath] == "D":
-            problems.append(f"was confirmed as deleted but got content: {fpath}")
-    for fpath in payload.get("deleted", []):
-        if fpath not in approved:
-            problems.append(f"unexpected path: {fpath}")
-        elif approved[fpath] != "D":
-            problems.append(f"was confirmed as {approved[fpath]} but got deletion: {fpath}")
-    received = set(payload.get("files", {}).keys()) | set(payload.get("deleted", []))
-    for fpath, status in approved.items():
-        if fpath not in received:
-            problems.append(f"missing from response: {fpath} (was {status})")
-    if problems:
-        for p in problems:
-            print(f"{Color.RED.value}  {p}{Color.WHITE.value}")
-        raise MikException(
-            f"{Color.RED.value}{len(problems)} mismatch(es) with confirmed list, aborting{Color.WHITE.value}"
-        )
+        raise MikException("Bad fetch response")
+    # Preemptive check — reject entire response if it is not exactly the confirmed list, contents decoded
+    contents, deleted_paths = _checked_remote_contents(payload, files)
     # Apply
     local = Path(local_repo)
     written = 0
     deleted = 0
-    for fpath, content_b64 in payload.get("files", {}).items():
+    for fpath, content in contents.items():
         dest = local / fpath
         dest.parent.mkdir(parents=True, exist_ok=True)
         # Atomic write: same-dir temp + replace, so a failure mid-fetch can't leave a truncated file.
         fd, tmp_path = tempfile.mkstemp(dir=dest.parent, prefix=f".{dest.name}.", suffix=".tmp")
         try:
             try:
-                os.write(fd, base64.b64decode(content_b64))
+                os.write(fd, content)
             finally:
                 os.close(fd)
             if dest.exists():
@@ -1224,7 +1310,7 @@ def dev_fetch_pod(args):
             raise
         print(f"  {Color.GREEN.value}wrote{Color.WHITE.value}  {fpath}")
         written += 1
-    for fpath in payload.get("deleted", []):
+    for fpath in deleted_paths:
         dest = local / fpath
         if dest.exists():
             dest.unlink()
@@ -1282,7 +1368,7 @@ def make_pinned_ssl_context(pinned_sha_256, cafile=None, capath=None, cadata=Non
     Returns an instance of a subclass of SSLContext that uses a subclass of SSLSocket
     that actually verifies the sha256 of the certificate during the TLS handshake
     pinned_sha_256 is a hex digest, or several of them: any is accepted (certificates overlap during a rotation)
-    Tested with `python-version: [3.8, 3.9, 3.10, 3.11, 3.12, 3.13]`
+    Tested with `python-version: [3.11, 3.12, 3.13, 3.14]`
     Original code can be found at https://github.com/c4ffein/python-snippets
     """
 
@@ -1474,12 +1560,19 @@ def ci_status(args):
         return 1 if any(r["state"] in _CI_RED_STATES for r in results) else 0
     project = projects.get(target)
     if not project:
-        raise MikException(f"{Color.RED.value}Project not found{Color.WHITE.value}")
+        raise MikException("Project not found")
     if not getattr(project, "github_repo", None):
-        raise MikException(f"{Color.RED.value}Project has no github_repo{Color.WHITE.value}")
+        raise MikException("Project has no github_repo")
     result = _fetch_ci_status(target, project.github_repo)
     _print_ci_line(result)
     return 1 if result["state"] in _CI_RED_STATES else 0
+
+
+# The names of mik's own that a config is meant to give a value to. Any other one it binds again is refused
+# (see load_config).
+CONFIG_SETTINGS = frozenset(
+    {"ROOT_CA_FILE", "GITHUB_COM_CERT_SHA256", "GITHUB_IO_CERT_SHA256", "ARTIFACTS_DIR", "RUNS_DIR"}
+)
 
 
 def load_config():
@@ -1488,6 +1581,7 @@ def load_config():
             file_content = f.read()
     except Exception as exc:
         raise MikException(f"Can't read the config file: {CONFIG_FILE}") from exc
+    own = dict(globals())
     try:
         exec(file_content, globals())
     except MikException:  # mik's own refusal (a duplicate name, a failed step...): it says what is wrong
@@ -1495,6 +1589,16 @@ def load_config():
     except Exception as exc:
         traceback.print_exc()
         raise MikException("Something wrong in the config file") from exc
+    # The config runs in this namespace, so a helper it calls `build` or a variable it calls `debug` takes the
+    # place of mik's: `mik build` would then run the config's function, without a word. Which names a config
+    # binds is only known once it has run, so this is checked right after, before any command gets to run.
+    # Importing what mik imports (os, Path, datetime...) binds the same object again and is fine.
+    taken = sorted(n for n, v in own.items() if n not in CONFIG_SETTINGS and globals().get(n, own) is not v)
+    if taken:
+        raise MikException(
+            f"The config file defines {', '.join(taken)}: mik has that name already, and the config would "
+            f"replace it. Use another name there. (What a config may set: {', '.join(sorted(CONFIG_SETTINGS))}.)"
+        )
     debug(f"loaded config from {CONFIG_FILE}")
 
 
@@ -1559,9 +1663,6 @@ def main(argv=None):
     # sub-command: build
     parser_build = subparsers.add_parser("build", help="build an instance's local artifact")
     parser_build.add_argument("instance", metavar="INSTANCE")
-    # sub-command: get-remote-source
-    parser_get_remote_source = subparsers.add_parser("get-remote-source", help="run an instance's get_remote_source")
-    parser_get_remote_source.add_argument("instance", metavar="INSTANCE")
     # sub-command: dev-fetch-pod
     parser_dev_fetch_pod = subparsers.add_parser(
         "dev-fetch-pod", help="Fetch changed files from an instance's container"
@@ -1592,7 +1693,6 @@ def main(argv=None):
         "list-instances": list_instances,
         "list-projects": list_projects,
         "autocomplete": autocomplete,
-        "get-remote-source": get_remote_source,
     }[args.command](args)
 
 
@@ -1604,10 +1704,10 @@ def cli():
     try:
         return main()
     except KeyboardInterrupt:
-        print("\n  !!  KeyboardInterrupt received  !!  \n")
+        print("\n  !!  KeyboardInterrupt received  !!  \n", file=sys.stderr)
         return 130  # conventional 128 + SIGINT(2)
-    except MikException as exc:
-        print(f"{Color.RED.value}\n  !!  {exc}  !!  \n{Color.WHITE.value}")
+    except MikException as exc:  # the one place an error gets its colour, and it goes to stderr
+        print(f"{Color.RED.value}\n  !!  {exc}  !!  \n{Color.WHITE.value}", file=sys.stderr)
         return 1
 
 
