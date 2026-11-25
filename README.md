@@ -65,7 +65,12 @@ class MyServer(Instance):
 Because the config runs in mik's namespace, a name of mik's own that it defines again (a
 helper called `build`, say) would replace mik's: that is refused when the config is loaded,
 naming it. The settings a config is meant to give a value to are the exception
-(`ROOT_CA_FILE`, `GITHUB_COM_CERT_SHA256`, `GITHUB_IO_CERT_SHA256`, `ARTIFACTS_DIR`, `RUNS_DIR`).
+(`ROOT_CA_FILE`, `GITHUB_COM_CERT_SHA256`, `GITHUB_IO_CERT_SHA256`, `ARTIFACTS_DIR`, `RUNS_DIR`,
+`POD_OUTPUT_MAX_BYTES`).
+
+And because it is run as Python, a config that somebody else could have written is not loaded:
+the file and its directory have to be yours (or root's) and writable by nobody else, as ssh
+wants for `~/.ssh/config` (`chmod go-w` them).
 
 ### Python deploy / build steps
 
@@ -101,7 +106,7 @@ ships a directory to the remote as an immutable release and atomically flips the
 release merged over those that were live in the last day, so a page loaded
 before the deploy still finds its hashed bundles),
 and `pinned_urlopen` / `make_pinned_ssl_context`
-for fetching over TLS with optional leaf-cert pinning (a pin is a SHA256, or a
+for fetching over TLS (`https://` URLs only) with optional leaf-cert pinning (a pin is a SHA256, or a
 list of them: the config can ask a command for the current ones, such as `tls-pin-get`
 from [crypto](https://github.com/c4ffein/crypto)). Each helper's full
 signature and semantics live in its docstring in `mik.py` (see `__all__` for the
@@ -147,6 +152,16 @@ and writes them into the project's `local_repo`. Paths are validated on both end
 directory a repository to git — symlinks rejected, in the pod and in the local repo:
 nothing is written or deleted through one) and the fetched set
 is checked against exactly what you confirmed before anything is written.
+
+What comes from the pod is then yours to review with `git status` / `git diff`, so a path that
+git would not show there is refused: `local_repo` has to be a git repository, and a path it
+ignores (`.venv/…`, `.env`: asked of `git check-ignore`, tracked files are not ignored) is not
+written or deleted. That is asked twice: before the question, with the `.gitignore` files that
+are there, and again before the first write, with those that came — so a pod cannot send a file
+together with the `.gitignore` that hides it. Nothing is written into a directory that holds a
+`HEAD` either (a bare repository already in the local repo, a test fixture), a path may be listed
+once and not as both a file and a directory, and a pod's answer is at most
+`POD_OUTPUT_MAX_BYTES` (512 MiB unless the config says otherwise).
 
 ### Run records
 A script `deploy` (a list of shell lines) streams its output live while

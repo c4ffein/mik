@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 import subprocess
 import shutil
+import stat
 import tarfile
 import tempfile
 import string
@@ -30,6 +31,7 @@ from ssl import (
     _ssl,
 )
 from sys import exit, flags as sys_flags
+from threading import Thread
 from typing import Optional
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
@@ -683,7 +685,7 @@ def validate_path(p):
     if not p or p.startswith("/"):
         return False
     for component in p.split("/"):
-        if not component or component == "..":
+        if not component or component in (".", ".."):  # "." too: "a/./b" is "a/b" under another name
             return False
         if component in ALLOWED_PATH_PARTS:
             continue
@@ -1131,7 +1133,7 @@ def validate_path(p):
     if not p or p.startswith("/"):
         return False
     for comp in p.split("/"):
-        if not comp or comp == "..":
+        if not comp or comp in (".", ".."):
             return False
         if comp in _allowed_parts:
             continue
@@ -1227,6 +1229,17 @@ def _checked_remote_files(files):
         ok = isinstance(f, dict) and f.get("status") in ("M", "A", "D") and isinstance(f.get("path"), str)
         if not ok or not validate_path(f["path"]):
             raise MikException(f"Refusing the remote file list, bad entry: {f!r}")
+    # One line per file: a path listed twice would be shown with two statuses and applied with the last, and a
+    # path that is a file here and a directory there ("a", "a/b") cannot be both — applying it would stop
+    # halfway. git says the second when a file became a directory: that one is to be done by hand.
+    paths = [f["path"] for f in files]
+    twice = sorted({path for path in paths if paths.count(path) > 1})
+    if twice:
+        raise MikException(f"Refusing the remote file list, listed more than once: {', '.join(twice)}")
+    above = {path.rsplit("/", i)[0] for path in paths for i in range(1, path.count("/") + 1)}
+    both = sorted(above & set(paths))
+    if both:
+        raise MikException(f"Refusing the remote file list, both a file and a directory in it: {', '.join(both)}")
     # Made again from the two checked fields: this list goes back into the fetch script, and anything else a
     # pod put beside them has no business travelling with it.
     return [{"path": f["path"], "status": f["status"]} for f in files]
@@ -1240,19 +1253,114 @@ def _local_destinations(local_repo, files):
     it, for a write as for a deletion. So every component is looked at, the last one included: nothing is
     written or deleted through a link, and a link is not replaced either. Whatever local_repo itself is, it is
     the config's to say.
+
+    Nor into a repository that is already there. validate_path refuses HEAD, so a pod cannot make a directory
+    one; but a bare repository the local repo already holds (a test fixture, `fixtures/x.git`) has its HEAD,
+    and its `config` and `hooks/` are plain names. So a directory on the way that holds a HEAD is refused.
+
+    And what is there has to be what the path says: directories on the way, a regular file at the end (or
+    nothing yet). Found here, before the question is asked, rather than by a write that fails halfway.
     """
     dests = {}
     for f in files:
         dest = Path(local_repo)
-        for component in f["path"].split("/"):
+        components = f["path"].split("/")
+        for depth, component in enumerate(components, 1):
             dest = dest / component
             if dest.is_symlink():
                 raise MikException(
                     f"Refusing {f['path']}: {dest} is a symlink in the local repo, and mik neither writes nor "
                     f"deletes through one. Nothing was fetched."
                 )
+            if depth < len(components):
+                if os.path.lexists(dest / "HEAD"):
+                    raise MikException(
+                        f"Refusing {f['path']}: {dest} holds a HEAD, which makes it a repository to git (its "
+                        f"config and hooks are obeyed), and mik writes nothing into one. Nothing was fetched."
+                    )
+                if dest.exists() and not dest.is_dir():
+                    raise MikException(f"Refusing {f['path']}: {dest} is not a directory here. Nothing was fetched.")
+            elif dest.exists() and not dest.is_file():
+                raise MikException(f"Refusing {f['path']}: {dest} is not a regular file here. Nothing was fetched.")
         dests[f["path"]] = dest
     return dests
+
+
+def _locally_ignored(local_repo, paths, coming=None):
+    """Those of `paths` that the local repo ignores, as git itself says (`git check-ignore`), in their order.
+
+    Why it matters: what a pod sent is reviewed with `git status` / `git diff` in the local repo, and a file
+    that is ignored there shows in neither. `.venv/lib/python3.13/site-packages/x.pth` is a plain path, and
+    runs at the next `python`; `.env` is one a deletion would take away. A pod that is honest never lists
+    such a file (its own `git status` leaves out what the same .gitignore ignores), so one that does is
+    refused. A file that is tracked is not ignored, whatever .gitignore says: git shows it, and it is not
+    returned here.
+
+    The rules are git's own to read (.gitignore at every level, negations, .git/info/exclude, the user's
+    core.excludesFile): none of that is done again here. So local_repo has to be a git repository, with git
+    there to ask — if it cannot be asked, nothing is fetched. The paths go through stdin, NUL-ended: none
+    is an argument.
+
+    `coming` is {path: content, or None for a deletion}: what is about to be done to the local repo, and the
+    .gitignore files in it are part of the rules. A pod could send a file and, with it, the .gitignore that
+    hides it. So git is not asked in the local repo but in a work tree made for the question, which holds
+    nothing but the .gitignore files a path depends on (those of the directories above it), each one as it
+    would be afterwards: the one that is coming, none if it is being deleted, else the one that is there.
+    The index, info/exclude and the config stay those of the local repo (--git-dir). The answer is then
+    about the repo as it would be, and nothing was written to it to know.
+    """
+    if not paths:
+        return []
+    coming = coming or {}
+
+    def git(*argv, **kw):
+        try:
+            return subprocess.run(["git", *argv], capture_output=True, **kw)
+        except OSError as exc:
+            raise MikException(
+                f"could not run git to ask what {local_repo} ignores: {exc}. Nothing was fetched."
+            ) from exc
+
+    def refuse(asked):
+        raise MikException(
+            f"could not ask git what {local_repo} ignores (rc={asked.returncode}), is it a git repository? "
+            f"Nothing was fetched.\n{_printable_lines(asked.stderr)}"
+        )
+
+    found = git("-C", str(local_repo), "rev-parse", "--absolute-git-dir", "--show-toplevel", "--show-prefix")
+    where = os.fsdecode(found.stdout).split("\n")
+    if found.returncode != 0 or len(where) != 4:  # three lines: a newline in one of these names is not read
+        refuse(found)
+    git_dir, toplevel, prefix = where[:3]  # prefix: local_repo from the top of the repository, "" or "sub/"
+    listed = [prefix + path for path in paths]
+    above = {""} | {path.rsplit("/", i)[0] + "/" for path in listed for i in range(1, path.count("/") + 1)}
+    with tempfile.TemporaryDirectory() as tree:
+        for directory in above:
+            name = directory + ".gitignore"
+            asked_of_pod = name[len(prefix) :] if name.startswith(prefix) else None
+            if asked_of_pod in coming:
+                rules = coming[asked_of_pod]
+            else:  # a link is not read, as git itself does not for a .gitignore
+                there = os.path.join(toplevel, name)
+                rules = Path(there).read_bytes() if os.path.isfile(there) and not os.path.islink(there) else None
+            if rules is not None:
+                os.makedirs(os.path.join(tree, directory), exist_ok=True)
+                Path(tree, name).write_bytes(rules)
+        asked = git(
+            f"--git-dir={git_dir}",
+            f"--work-tree={tree}",
+            "check-ignore",
+            "--stdin",
+            "-z",
+            cwd=tree,
+            input=b"".join(os.fsencode(path) + b"\0" for path in listed),
+        )
+    if asked.returncode == 1:  # git's way to say: none of them
+        return []
+    if asked.returncode != 0:
+        refuse(asked)
+    ignored = {os.fsdecode(path) for path in asked.stdout.split(b"\0") if path}
+    return [path for path in paths if prefix + path in ignored]
 
 
 def _checked_remote_contents(payload, files):
@@ -1305,12 +1413,49 @@ def _printable_lines(raw):
     return "\n".join(_printable(line) for line in raw.decode(errors="replace").splitlines())
 
 
+# The most a pod gets to answer, in bytes, on stdout as on stderr (the config may set another). What comes is
+# held in memory, and files come in base64 twice over: 512 MiB of answer is some 288 MiB of files.
+POD_OUTPUT_MAX_BYTES = 512 * 1024 * 1024
+
+
+def _pop_capped(cmda, limit):
+    """pop(), for a command whose output a pod writes: (returncode, stderr, stdout), each of `limit` bytes at most.
+
+    Once more than that came on either, the command is killed and the answer refused: a pod does not get to
+    fill the memory of this machine. stderr is read in a thread of its own — a command that fills one pipe
+    while only the other is read never ends.
+    """
+    out, err, over = [], [], []
+
+    def drain(pipe, chunks):
+        held = 0
+        while chunk := pipe.read1(1 << 16):
+            held += len(chunk)
+            if held > limit:
+                over.append(held)
+                proc.kill()
+                return
+            chunks.append(chunk)
+
+    with subprocess.Popen(cmda, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE) as proc:
+        side = Thread(target=drain, args=(proc.stderr, err), daemon=True)
+        side.start()
+        drain(proc.stdout, out)
+        side.join()
+    if over:
+        raise MikException(
+            f"the pod answered with more than {limit} bytes: refused, and nothing was fetched. "
+            f"(POD_OUTPUT_MAX_BYTES, in the config, if that much is expected.)"
+        )
+    return proc.returncode, b"".join(err), b"".join(out)
+
+
 def _run_remote_script(ssh_host, container, script):
     encoded = base64.b64encode(script.encode()).decode()
-    c, e, r = pop(
-        ["ssh", ssh_host, f"docker exec {container} python3 -c \"import base64 as b;exec(b.b64decode('{encoded}'))\""]
+    return _pop_capped(
+        ["ssh", ssh_host, f"docker exec {container} python3 -c \"import base64 as b;exec(b.b64decode('{encoded}'))\""],
+        POD_OUTPUT_MAX_BYTES,
     )
-    return c, e, r
 
 
 def dev_fetch_pod(args):
@@ -1345,15 +1490,23 @@ def dev_fetch_pod(args):
         data = json.loads(r.decode())
     except ValueError:  # not JSON, or not UTF-8
         data = None
-    if not isinstance(data, dict):
+    warnings = data.get("errors") or [] if isinstance(data, dict) else None
+    if not isinstance(warnings, list):
         raise MikException(f"Bad response from remote: {r[:200]}")
-    for err in data.get("errors") or []:
+    for err in warnings:
         print(f"{Color.DIM.value}  warning: {_printable(err)}{Color.WHITE.value}")
     files = _checked_remote_files(data.get("files", []))
     if not files:
         print("No changes found.")
         return
     dests = _local_destinations(local_repo, files)  # no symlink on the way, checked before the question is asked
+    ignored = _locally_ignored(local_repo, [f["path"] for f in files])
+    if ignored:
+        raise MikException(
+            f"Refusing the remote file list: the local repo ignores {', '.join(ignored)}. `git status` and "
+            f"`git diff` would not show what was done to them, and a pod has no reason to list what is "
+            f"ignored. Nothing was fetched."
+        )
     # Display
     for f in files:
         color = Color.RED.value if f["status"] == "D" else Color.GREEN.value
@@ -1376,6 +1529,14 @@ def dev_fetch_pod(args):
         raise MikException("Bad fetch response")
     # Preemptive check — reject entire response if it is not exactly the confirmed list, contents decoded
     contents, deleted_paths = _checked_remote_contents(payload, files)
+    # Asked again before the first write, now that the contents are here: the .gitignore files that came are
+    # part of the rules, and one of them may hide a file that came with it. Judged as the repo would be.
+    hidden = _locally_ignored(local_repo, [f["path"] for f in files], {**contents, **dict.fromkeys(deleted_paths)})
+    if hidden:
+        raise MikException(
+            f"Refusing what the pod sent: with the .gitignore that comes with it, the local repo would ignore "
+            f"{', '.join(hidden)}, and `git status` would not show them. Nothing was written."
+        )
     # Apply
     written = 0
     deleted = 0
@@ -1531,7 +1692,14 @@ def pinned_urlopen(url, pinned_sha256=None, cafile=None, timeout=10):
     Returns the response object (use as a context manager). `pinned_sha256` is a hex digest or a list of
     them (see configured_pins). `cafile` defaults to ROOT_CA_FILE. With no pin (None) it's a plain
     urlopen. Config build steps use it to fetch release archives (e.g. github.io) over https.
+
+    https:// only, pin or not: over http:// or file:// there is no certificate, and a pin would be given
+    for nothing without a word. (A redirect is followed as urlopen does: where the server that was verified
+    sends you is that server's to say.)
     """
+    target = url.full_url if isinstance(url, Request) else url
+    if not (isinstance(target, str) and target.lower().startswith("https://")):
+        raise MikException(f"pinned_urlopen fetches https:// URLs only, got {target!r}")
     context = None
     if pinned_sha256 is not None:
         context = make_pinned_ssl_context(configured_pins(pinned_sha256), cafile=cafile or ROOT_CA_FILE)
@@ -1677,14 +1845,47 @@ def ci_status(args):
 # The names of mik's own that a config is meant to give a value to. Any other one it binds again is refused
 # (see load_config).
 CONFIG_SETTINGS = frozenset(
-    {"ROOT_CA_FILE", "GITHUB_COM_CERT_SHA256", "GITHUB_IO_CERT_SHA256", "ARTIFACTS_DIR", "RUNS_DIR"}
+    {
+        "ROOT_CA_FILE",
+        "GITHUB_COM_CERT_SHA256",
+        "GITHUB_IO_CERT_SHA256",
+        "ARTIFACTS_DIR",
+        "RUNS_DIR",
+        "POD_OUTPUT_MAX_BYTES",
+    }
 )
+
+
+def _refuse_config_others_can_write(f):
+    """Refuse a config that somebody else could have written: it is run as Python, as you.
+
+    As ssh does for ~/.ssh/config: the file is yours (or root's) and nobody else may write it. The same for
+    the directory it is in — whoever can write there can put another file under that name — unless it is
+    sticky (/tmp: there, a file of yours is renamed by nobody else). The file looked at is the one that is
+    open (fstat), not whatever has its name by now.
+    """
+    ours = (os.geteuid(), 0)
+    st = os.fstat(f.fileno())
+    if st.st_uid not in ours or st.st_mode & 0o022:
+        raise MikException(
+            f"{CONFIG_FILE} is run as Python: it has to be yours, and writable by nobody else "
+            f"(chmod go-w {CONFIG_FILE})"
+        )
+    st = os.stat(CONFIG_FILE.parent)
+    if st.st_uid not in ours or (st.st_mode & 0o022 and not st.st_mode & stat.S_ISVTX):
+        raise MikException(
+            f"{CONFIG_FILE} is run as Python: its directory has to be yours, and writable by nobody else "
+            f"(chmod go-w {CONFIG_FILE.parent})"
+        )
 
 
 def load_config():
     try:
         with CONFIG_FILE.open("r") as f:
+            _refuse_config_others_can_write(f)
             file_content = f.read()
+    except MikException:
+        raise
     except Exception as exc:
         raise MikException(f"Can't read the config file: {CONFIG_FILE}") from exc
     own = dict(globals())

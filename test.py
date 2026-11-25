@@ -56,6 +56,13 @@ class ValidatePathTests(unittest.TestCase):
         for p in ("/etc/passwd", "../secret", "a/../b", "", "a//b"):
             self.assertFalse(mik.validate_path(p), p)
 
+    def test_a_dot_is_not_a_name(self):
+        # "." is the repo itself and "a/./b" is "a/b" again: one file, one way to write its path.
+        for p in (".", "a/.", "./Makefile", "a/./b"):
+            self.assertFalse(mik.validate_path(p), p)
+        for p in ("...", "a/.b", ".a/b."):
+            self.assertTrue(mik.validate_path(p), p)
+
     def test_rejects_git_and_known_junk(self):
         # The real repo-hijack vectors stay blocked (they alter checkout/filter/hook behavior).
         for p in (".git/config", ".gitmodules", ".gitattributes", "node_modules/x", "a/__pycache__/b.pyc"):
@@ -93,6 +100,7 @@ class ValidatePathTests(unittest.TestCase):
         for p in (
             *("a.txt", "src/main.py", ".gitignore", ".github/workflows/ci.yml", "sub/.gitkeep", "-a/b_c.d"),
             *("/etc/passwd", "../x", "a/../b", "", "a//b", ".git/config", ".gitmodules", "node_modules/x"),
+            *(".", "a/.", "./Makefile", "a/./b", "...", "a/.b"),
             *("a b", "a$b", "é.txt", ".GITHUB/x", "Node_Modules/x", *self._ANY_CASE),
             *("tools/x/HEAD", "head", "a/Head/b", "HEAD.md", "tools/x/config", "tools/x/objects/a"),
         ):
@@ -488,6 +496,12 @@ class ListingTests(unittest.TestCase):
 
 
 class DevFetchPodTests(unittest.TestCase):
+    def setUp(self):
+        # These local repos are plain directories: what git ignores is DevFetchPodIgnoredTests' to test.
+        patcher = mock.patch.object(mik, "_locally_ignored", return_value=[])
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     def _setup(self, local_repo):
         mik.instances_dict.clear()
         mik.machines_dict.clear()
@@ -661,6 +675,82 @@ class DevFetchPodTests(unittest.TestCase):
                 shown = "".join(str(c.args[0]) for c in printed.call_args_list if c.args)
                 self.assertNotIn("\033[2J", shown)
 
+    def test_refuses_a_file_list_that_cannot_be_applied_as_shown(self):
+        for name, files, said in (
+            ("twice", [("a.txt", "M"), ("b.txt", "M"), ("a.txt", "D")], "more than once: a.txt"),
+            ("a file and a directory", [("a", "D"), ("a/b.txt", "A")], "both a file and a directory in it: a"),
+            ("deeper", [("x/a/b/c.txt", "A"), ("x/a", "M")], "both a file and a directory in it: x/a"),
+        ):
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as d:
+                self._setup(d)
+                listed = [{"path": path, "status": status} for path, status in files]
+                list_resp = json.dumps({"files": listed, "errors": []}).encode()
+                with (
+                    mock.patch.object(mik, "_run_remote_script", side_effect=[(0, b"", list_resp)]),
+                    mock.patch("builtins.input", mock.Mock(side_effect=AssertionError("asked a question"))),
+                    mock.patch("builtins.print"),
+                ):
+                    with self.assertRaises(mik.MikException) as ctx:
+                        mik.dev_fetch_pod(SimpleNamespace(instance="inst"))
+                self.assertIn(said, str(ctx.exception))
+                self.assertEqual(os.listdir(d), [])
+
+    def test_a_list_answer_with_errors_that_are_no_list_is_refused_in_a_line(self):
+        for errors in (5, "boom", {"a": 1}):
+            list_resp = json.dumps({"files": [{"path": "a.txt", "status": "M"}], "errors": errors}).encode()
+            with self.subTest(errors=errors), tempfile.TemporaryDirectory() as d:
+                self._setup(d)
+                with (
+                    mock.patch.object(mik, "_run_remote_script", side_effect=[(0, b"", list_resp)]),
+                    mock.patch("builtins.print"),
+                ):
+                    with self.assertRaises(mik.MikException):
+                        mik.dev_fetch_pod(SimpleNamespace(instance="inst"))
+
+    def test_nothing_goes_into_a_repository_that_is_already_there(self):
+        # No HEAD from a pod, so it makes no repository; one the local repo holds already has its HEAD.
+        for path in ("fixtures/repo.git/config", "fixtures/repo.git/hooks/pre-commit", "fixtures/repo.git/a/b.txt"):
+            with self.subTest(path=path), tempfile.TemporaryDirectory() as d:
+                bare = Path(d) / "fixtures" / "repo.git"
+                (bare / "hooks").mkdir(parents=True)
+                (bare / "HEAD").write_text("ref: refs/heads/main\n")
+                (bare / "config").write_text("[core]\n")
+                before = sorted(str(x) for x in Path(d).rglob("*"))
+                self._setup(d)
+                list_resp = json.dumps({"files": [{"path": path, "status": "A"}], "errors": []}).encode()
+                with (
+                    mock.patch.object(mik, "_run_remote_script", side_effect=[(0, b"", list_resp)]) as remote,
+                    mock.patch("builtins.input", mock.Mock(side_effect=AssertionError("asked a question"))),
+                    mock.patch("builtins.print"),
+                ):
+                    with self.assertRaises(mik.MikException) as ctx:
+                        mik.dev_fetch_pod(SimpleNamespace(instance="inst"))
+                self.assertIn("holds a HEAD", str(ctx.exception))
+                self.assertEqual(remote.call_count, 1)
+                self.assertEqual(sorted(str(x) for x in Path(d).rglob("*")), before)
+                self.assertEqual((bare / "config").read_text(), "[core]\n")
+
+    def test_what_is_there_has_to_be_what_the_path_says(self):
+        for name, path, said in (
+            ("a file where a directory is", "src", "is not a regular file here"),
+            ("a directory where a file is", "Makefile/x.txt", "is not a directory here"),
+        ):
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as d:
+                (Path(d) / "src").mkdir()
+                (Path(d) / "Makefile").write_text("all:\n")
+                self._setup(d)
+                files = [{"path": "ok.txt", "status": "M"}, {"path": path, "status": "M"}]
+                list_resp = json.dumps({"files": files, "errors": []}).encode()
+                with (
+                    mock.patch.object(mik, "_run_remote_script", side_effect=[(0, b"", list_resp)]),
+                    mock.patch("builtins.input", mock.Mock(side_effect=AssertionError("asked a question"))),
+                    mock.patch("builtins.print"),
+                ):
+                    with self.assertRaises(mik.MikException) as ctx:
+                        mik.dev_fetch_pod(SimpleNamespace(instance="inst"))
+                self.assertIn(said, str(ctx.exception))
+                self.assertEqual(sorted(os.listdir(d)), ["Makefile", "src"])
+
     def test_stderr_from_the_pod_cannot_carry_escape_sequences(self):
         # `docker exec ... python3`: the python3 that answers is the pod's own, and so is what it writes.
         with tempfile.TemporaryDirectory() as d:
@@ -682,6 +772,181 @@ class DevFetchPodTests(unittest.TestCase):
             ):
                 mik.dev_fetch_pod(SimpleNamespace(instance="inst"))
         self.assertIn("\033[90m  warning: invalid path: a[2Kb\033[39m", [c.args[0] for c in printed.call_args_list])
+
+
+@unittest.skipUnless(shutil.which("git"), "needs git")
+class DevFetchPodIgnoredTests(unittest.TestCase):
+    """What the local repo ignores, `git status` there does not show: a pod does not get to write or delete it."""
+
+    def _git(self, repo, *argv):
+        base = ["git", "-C", str(repo), "-c", "user.email=t@example.invalid", "-c", "user.name=t"]
+        subprocess.run([*base, "-c", "commit.gpgsign=false", *argv], check=True, capture_output=True)
+
+    def _repo(self, d):
+        repo = Path(d) / "repo"
+        (repo / ".venv" / "lib").mkdir(parents=True)
+        self._git(repo, "init", "-q")
+        (repo / ".gitignore").write_text(".venv/\n.env\n*.log\n!kept.log\n")
+        (repo / "app.py").write_text("a\n")
+        (repo / ".env").write_text("SECRET=1\n")
+        self._git(repo, "add", ".gitignore", "app.py")
+        (repo / "tracked.log").write_text("t\n")
+        self._git(repo, "add", "-f", "tracked.log")
+        self._git(repo, "commit", "-q", "-m", "init")
+        for registry in (mik.instances_dict, mik.machines_dict, mik.projects_dict):
+            registry.clear()
+            self.addCleanup(registry.clear)
+        mik.machines_dict["box"] = SimpleNamespace(name="box", ssh_host="user@host")
+        mik.projects_dict["proj"] = SimpleNamespace(name="proj", local_repo=str(repo), github_repo=None)
+        mik.instances_dict["inst"] = _inst("inst", project="proj", machine="box", container="c1", code_dir="/code")
+        return repo
+
+    def _fetch(self, files, answer=True):
+        """Run dev-fetch-pod against a pod that lists [(path, status, content)] and sends just that."""
+        listed = [{"path": path, "status": status} for path, status, _ in files]
+        payload = {
+            "files": {p: mik.base64.b64encode(c).decode() for p, status, c in files if status != "D"},
+            "deleted": [p for p, status, _ in files if status == "D"],
+        }
+        responses = [(0, b"", json.dumps({"files": listed, "errors": []}).encode())]
+        if answer:
+            responses.append((0, b"", mik.base64.b64encode(json.dumps(payload).encode())))
+        with (
+            mock.patch.object(mik, "_run_remote_script", side_effect=responses) as remote,
+            mock.patch("builtins.input", return_value="y" if answer else mock.DEFAULT) as asked,
+            mock.patch("builtins.print"),
+        ):
+            try:
+                mik.dev_fetch_pod(SimpleNamespace(instance="inst"))
+            finally:
+                self.calls, self.asked = remote.call_count, asked.call_count
+
+    def test_what_git_knows_is_asked_of_git(self):
+        with tempfile.TemporaryDirectory() as d:
+            repo = self._repo(d)
+            paths = ["app.py", ".venv/lib/x.pth", "new.py", "sub/debug.log", "kept.log", "tracked.log", ".env"]
+            self.assertEqual(mik._locally_ignored(str(repo), paths), [".venv/lib/x.pth", "sub/debug.log", ".env"])
+            self.assertEqual(mik._locally_ignored(str(repo), ["app.py", "new.py"]), [])
+            self.assertEqual(mik._locally_ignored(str(repo), []), [])
+
+    def test_an_ignored_path_is_refused_before_the_question_written_or_deleted(self):
+        for path, status in ((".venv/lib/x.pth", "A"), ("sub/debug.log", "M"), (".env", "D")):
+            with self.subTest(path=path), tempfile.TemporaryDirectory() as d:
+                repo = self._repo(d)
+                with self.assertRaises(mik.MikException) as ctx:
+                    self._fetch([("app.py", "M", b"b\n"), (path, status, b"import os\n")], answer=False)
+                self.assertIn(f"the local repo ignores {path}.", str(ctx.exception))
+                self.assertEqual((self.calls, self.asked), (1, 0))  # no question, no fetch
+                self.assertEqual((repo / "app.py").read_text(), "a\n")
+                self.assertEqual((repo / ".env").read_text(), "SECRET=1\n")
+                self.assertEqual(os.listdir(repo / ".venv" / "lib"), [])
+
+    def test_what_git_shows_is_fetched(self):
+        with tempfile.TemporaryDirectory() as d:
+            repo = self._repo(d)
+            self._fetch([("app.py", "M", b"b\n"), ("new.py", "A", b"n\n"), ("tracked.log", "M", b"t2\n")])
+            self.assertEqual((repo / "app.py").read_text(), "b\n")
+            self.assertEqual((repo / "new.py").read_text(), "n\n")
+            self.assertEqual((repo / "tracked.log").read_text(), "t2\n")  # tracked: shown by git, ignored or not
+
+    def test_a_gitignore_that_comes_with_a_file_and_hides_it_stops_everything_before_a_write(self):
+        old_rules = ".venv/\n.env\n*.log\n!kept.log\n"
+        for name, files, hidden in (
+            (
+                "the one at the top",
+                [(".gitignore", "M", b".venv/\nconftest.py\n"), ("conftest.py", "A", b"import os\n")],
+                "conftest.py",
+            ),
+            (
+                "a new one in a new directory",
+                [("pkg/.gitignore", "A", b"*.pth\n"), ("pkg/deep/x.pth", "A", b"import os\n")],
+                "pkg/deep/x.pth",
+            ),
+            ("one that hides itself", [("pkg/.gitignore", "A", b".gitignore\n")], "pkg/.gitignore"),
+        ):
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as d:
+                repo = self._repo(d)
+                before = sorted(str(x) for x in repo.rglob("*") if ".git/" not in str(x))
+                with self.assertRaises(mik.MikException) as ctx:
+                    self._fetch([("app.py", "M", b"b\n"), *files])
+                self.assertIn(f"would ignore {hidden}, and", str(ctx.exception))
+                self.assertEqual(self.calls, 2)  # the contents were needed to know
+                self.assertEqual(sorted(str(x) for x in repo.rglob("*") if ".git/" not in str(x)), before)
+                self.assertEqual((repo / "app.py").read_text(), "a\n")
+                self.assertEqual((repo / ".gitignore").read_text(), old_rules)
+
+    def test_the_rules_are_those_the_repo_would_have(self):
+        with tempfile.TemporaryDirectory() as d:
+            repo = self._repo(d)
+            ask = lambda paths, coming: mik._locally_ignored(str(repo), paths, coming)  # noqa: E731
+            self.assertEqual(ask(["a.py", "x.log"], {".gitignore": b"a.py\n"}), ["a.py"])  # *.log is gone
+            self.assertEqual(ask(["a.py", "x.log", ".env"], {".gitignore": None}), [])  # deleted: no rule left
+            self.assertEqual(ask(["s/a.py", "t/a.py"], {"s/.gitignore": b"a.py\n"}), ["s/a.py"])
+            self.assertEqual(ask(["s/x.log"], {"s/.gitignore": b"!x.log\n"}), [])  # a negation, read by git
+            self.assertEqual(ask(["tracked.log"], {".gitignore": b"*\n"}), [])  # tracked: git shows it
+            (repo / ".git" / "info" / "exclude").write_text("local-only.txt\n")
+            self.assertEqual(ask(["local-only.txt"], {".gitignore": b""}), ["local-only.txt"])  # not .gitignore's
+            self.assertEqual((repo / ".gitignore").read_text(), ".venv/\n.env\n*.log\n!kept.log\n")
+            self.assertFalse((repo / "s").exists())  # asked elsewhere: nothing was written to know
+
+    def test_a_gitignore_that_hides_nothing_that_came_is_fetched(self):
+        with tempfile.TemporaryDirectory() as d:
+            repo = self._repo(d)
+            self._fetch([(".gitignore", "M", b".venv/\n.env\n*.log\ndist/\n"), ("new.py", "A", b"n\n")])
+            self.assertEqual((repo / ".gitignore").read_text(), ".venv/\n.env\n*.log\ndist/\n")
+            self.assertEqual((repo / "new.py").read_text(), "n\n")
+
+    def test_a_local_repo_that_is_a_directory_of_a_repository(self):
+        # The rules above local_repo count too, and the paths are from local_repo.
+        with tempfile.TemporaryDirectory() as d:
+            repo = self._repo(d)
+            (repo / "sub").mkdir()
+            (repo / "sub" / ".gitignore").write_text("secret.txt\n")
+            ask = lambda paths, coming=None: mik._locally_ignored(str(repo / "sub"), paths, coming)  # noqa: E731
+            self.assertEqual(ask(["a.py", "x.log", "secret.txt", "deep/x.log"]), ["x.log", "secret.txt", "deep/x.log"])
+            self.assertEqual(ask(["a.py", "secret.txt"], {".gitignore": b"a.py\n"}), ["a.py"])
+
+    def test_a_local_repo_git_cannot_be_asked_about_gets_nothing(self):
+        with tempfile.TemporaryDirectory() as d:
+            self._repo(d)
+            plain = Path(d) / "plain"
+            plain.mkdir()
+            mik.projects_dict["proj"].local_repo = str(plain)
+            with mock.patch.dict(os.environ, {"GIT_CEILING_DIRECTORIES": d}):
+                with self.assertRaises(mik.MikException) as ctx:
+                    self._fetch([("a.txt", "A", b"x")], answer=False)
+            self.assertIn("is it a git repository?", str(ctx.exception))
+            self.assertEqual((self.calls, self.asked), (1, 0))
+            self.assertEqual(os.listdir(plain), [])
+        with mock.patch.object(mik.subprocess, "run", side_effect=FileNotFoundError("git")):
+            with self.assertRaises(mik.MikException):
+                mik._locally_ignored("/nowhere", ["a.txt"])
+
+
+class PopCappedTests(unittest.TestCase):
+    def _py(self, code):
+        return [sys.executable, "-c", code]
+
+    def test_what_fits_comes_back_as_pop_gives_it(self):
+        code = "import sys; sys.stdout.write('o' * 1000); sys.stderr.write('e' * 1000); sys.exit(3)"
+        self.assertEqual(mik._pop_capped(self._py(code), 1000), (3, b"e" * 1000, b"o" * 1000))
+
+    def test_more_than_the_limit_on_either_is_refused(self):
+        for stream in ("stdout", "stderr"):
+            with self.subTest(stream=stream):
+                code = f"import sys\nwhile True: sys.{stream}.write('x' * 65536)"  # never ends by itself
+                with self.assertRaises(mik.MikException) as ctx:
+                    mik._pop_capped(self._py(code), 200_000)
+                self.assertIn("more than 200000 bytes", str(ctx.exception))
+
+    def test_a_remote_script_is_run_under_the_limit(self):
+        with (
+            mock.patch.object(mik, "_pop_capped", return_value=(0, b"", b"{}")) as capped,
+            mock.patch.object(mik, "POD_OUTPUT_MAX_BYTES", 123),
+        ):
+            self.assertEqual(mik._run_remote_script("user@host", "c1", "print(1)"), (0, b"", b"{}"))
+        (argv, limit), _ = capped.call_args
+        self.assertEqual((argv[:2], limit), (["ssh", "user@host"], 123))
 
 
 @unittest.skipUnless(shutil.which("git"), "needs git")
@@ -752,6 +1017,7 @@ class ConfigNameCollisionTests(unittest.TestCase):
     def _load(self, config):
         with tempfile.TemporaryDirectory() as d:
             (Path(d) / "config.py").write_text(config)
+            os.chmod(Path(d) / "config.py", 0o600)  # whatever the umask: load_config wants it yours alone
             with mock.patch.object(mik, "CONFIG_FILE", Path(d) / "config.py"):
                 mik.load_config()
 
@@ -788,6 +1054,48 @@ class ConfigNameCollisionTests(unittest.TestCase):
             self.assertIs(mik.my_collision_test_helper(), mik.run_step)
 
 
+class ConfigPermissionTests(unittest.TestCase):
+    """The config is run as Python: one that somebody else could have written is not."""
+
+    def _load(self, file_mode, dir_mode):
+        with tempfile.TemporaryDirectory() as d:
+            inside = Path(d) / "mik"
+            inside.mkdir()
+            (inside / "config.py").write_text("config_permission_test_ran = True\n")
+            os.chmod(inside / "config.py", file_mode)
+            os.chmod(inside, dir_mode)
+            self.addCleanup(lambda: vars(mik).pop("config_permission_test_ran", None))
+            with mock.patch.object(mik, "CONFIG_FILE", inside / "config.py"):
+                mik.load_config()
+
+    def test_yours_alone_is_run(self):
+        for file_mode, dir_mode in ((0o600, 0o700), (0o644, 0o755), (0o644, 0o1777)):  # the last: as in /tmp
+            with self.subTest(file_mode=oct(file_mode), dir_mode=oct(dir_mode)):
+                vars(mik).pop("config_permission_test_ran", None)
+                self._load(file_mode, dir_mode)
+                self.assertTrue(mik.config_permission_test_ran)
+
+    def test_one_that_others_can_write_is_not_run(self):
+        for file_mode, dir_mode, said in (
+            (0o664, 0o700, "it has to be yours"),
+            (0o646, 0o700, "it has to be yours"),
+            (0o600, 0o775, "its directory has to be yours"),
+            (0o600, 0o777, "its directory has to be yours"),
+        ):
+            with self.subTest(file_mode=oct(file_mode), dir_mode=oct(dir_mode)):
+                with self.assertRaises(mik.MikException) as ctx:
+                    self._load(file_mode, dir_mode)
+                self.assertIn(said, str(ctx.exception))
+                self.assertFalse(hasattr(mik, "config_permission_test_ran"))
+
+    def test_somebody_elses_file_is_not_run(self):
+        with mock.patch.object(mik.os, "geteuid", return_value=os.geteuid() + 1):
+            if os.geteuid() == 0:
+                self.skipTest("root's own files are trusted")
+            with self.assertRaises(mik.MikException):
+                self._load(0o600, 0o700)
+
+
 class DuplicateNameTests(unittest.TestCase):
     """Defining a subclass registers it under its name: a second one with that name must not replace it."""
 
@@ -821,6 +1129,7 @@ class DuplicateNameTests(unittest.TestCase):
         self.addCleanup(lambda: [vars(mik).pop(n, None) for n in ("DupTestOne", "DupTestTwo")])
         with tempfile.TemporaryDirectory() as d:
             (Path(d) / "config.py").write_text(config)
+            os.chmod(Path(d) / "config.py", 0o600)  # whatever the umask: load_config wants it yours alone
             with mock.patch.object(mik, "CONFIG_FILE", Path(d) / "config.py"):
                 with contextlib.redirect_stderr(io.StringIO()) as err:
                     with self.assertRaises(mik.MikException) as ctx:
@@ -981,6 +1290,20 @@ class PinnedUrlopenTests(unittest.TestCase):
             with mik.pinned_urlopen("https://x/y"):
                 pass
         self.assertIsNone(captured["context"])
+
+    def test_https_only_pin_or_not(self):
+        # Over anything else there is no certificate: a pin would be given for nothing, without a word.
+        with mock.patch.object(mik, "urlopen", side_effect=AssertionError("connected")):
+            for url in ("http://x/y", "file:///etc/passwd", "ftp://x/y", "x/y", mik.Request("http://x/y"), None):
+                for pin in (self.PIN, None):
+                    with self.subTest(url=url, pin=pin), self.assertRaises(mik.MikException):
+                        mik.pinned_urlopen(url, pin)
+
+    def test_a_request_object_and_any_case_of_the_scheme_are_fine(self):
+        with mock.patch.object(mik, "urlopen", return_value=_FakeResp(b"x")) as opened:
+            mik.pinned_urlopen(mik.Request("https://x/y"))
+            mik.pinned_urlopen("HTTPS://x/y")
+        self.assertEqual(opened.call_count, 2)
 
 
 class RollupTests(unittest.TestCase):
