@@ -54,11 +54,12 @@ class MyServer(Instance):
     machine = "vps"                      # -> a Machine name
     container = "myproject-web-1"         # docker container on the remote (for dev-fetch-pod)
     code_dir = "/app"                     # the git checkout inside that container (for dev-fetch-pod)
-    deploy = [                            # shell lines run LOCALLY for `mik deploy myserver`
-        "cd ~/code/myserver",
+    deploy = [                            # shell lines run LOCALLY for `mik deploy myserver`, under
+        "cd ~/code/myserver",             # `set -e`: a line that fails stops the deploy there
         "make deploy",
     ]
-    # deploy_shell = "/bin/bash"          # optional interpreter for the deploy lines (default /bin/bash)
+    # deploy_shell = "/bin/bash"          # optional interpreter for the deploy lines (default /bin/bash;
+    #                                     # `set -e` is only added for sh, bash, dash, ksh, zsh)
 ```
 
 Because the config runs in mik's namespace, a name of mik's own that it defines again (a
@@ -142,7 +143,9 @@ Resolves the instance's `machine.ssh_host`, `container` and `code_dir`, runs
 / deleted files (what the pod's `.gitignore` ignores stays out; a rename is a
 deletion and a new file), and — only after you confirm — fetches their contents
 and writes them into the project's `local_repo`. Paths are validated on both ends
-(no absolute paths, no `..`, no `.git/`, symlinks rejected) and the fetched set
+(no absolute paths, no `..`, no `.git/` in any case, no `HEAD` — what makes a
+directory a repository to git — symlinks rejected, in the pod and in the local repo:
+nothing is written or deleted through one) and the fetched set
 is checked against exactly what you confirmed before anything is written.
 
 ### Run records

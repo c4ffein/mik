@@ -3,7 +3,7 @@ name = "mik"
 version = "0.0.4"
 description = "KISS project and server management"
 readme = "README.md"
-requires-python = ">=3.11"
+requires-python = ">=3.13"
 license = "MIT"
 license-files = ["LICENSE"]
 authors = [
@@ -40,7 +40,7 @@ package = false
 
 [tool.ruff]
 line-length = 120
-target-version = "py311"
+target-version = "py313"
 
 [tool.ruff.format]
 # ruff format replaces black

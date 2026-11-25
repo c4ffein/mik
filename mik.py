@@ -338,6 +338,9 @@ def autocomplete(args):
             print(i)
 
 
+_POSIX_SHELLS = ("sh", "bash", "dash", "ksh", "zsh")
+
+
 def deploy(args):
     instance_name = args.instance
     inst = instances_dict.get(instance_name)
@@ -354,8 +357,14 @@ def deploy(args):
         raise MikException(f"{instance_name} has a script deploy; RELEASE_ID not supported")
     if not d:
         raise MikException("Instance has no deploy script")
+    shell = getattr(inst, "deploy_shell", None) or "/bin/bash"
     s = "\n".join(d)
-    rc, _ = run_recorded("deploy", instance_name, s, getattr(inst, "deploy_shell", None) or "/bin/bash")
+    # A line that fails stops the deploy there: without it, a `cd` that failed would be followed by `make
+    # deploy` run from wherever the shell was, and only the last line's return code would tell. Only said to
+    # a shell that knows `set -e` — deploy_shell may be any interpreter.
+    if os.path.basename(shell) in _POSIX_SHELLS:
+        s = "set -e\n" + s
+    rc, _ = run_recorded("deploy", instance_name, s, shell)
     if rc != 0:
         raise MikException(f"deploy failed (rc={rc})")
 
@@ -456,7 +465,13 @@ ARTIFACTS_DIR = Path.home() / "artifacts"
 
 
 def artifact_category_dir(category):
-    """Config helper: the directory holding every release of one artifact category."""
+    """Config helper: the directory holding every release of one artifact category.
+
+    The category is one plain name ([A-Za-z0-9-._], not "." or ".."): it is a directory right under
+    ARTIFACTS_DIR, and what prune_artifacts() deletes is looked for in it.
+    """
+    if not _is_plain_name(category):
+        raise MikException(f"invalid artifact category (want letters, digits, - . _): {category!r}")
     return ARTIFACTS_DIR / category
 
 
@@ -477,13 +492,11 @@ def build_artifact(category, suffix, build, release_id=None):
     <release_id>-<suffix>, on any error it is removed so no partial entry litters the store.
     """
     rid = str(release_id if release_id is not None else int(datetime.now().timestamp()))
-    if not rid.isdigit():
+    if not (rid.isascii() and rid.isdigit()):  # isdigit() alone says yes to "²", that int() then refuses
         raise MikException(f"bad release_id (want epoch digits): {rid!r}")
-    if not all(c.isalnum() or c in ".-_" for c in category):
-        raise MikException(f"invalid category when building artifact: {category}")
-    if not all(c.isalnum() or c in ".-_" for c in suffix):
-        raise MikException(f"invalid suffix when building artifact: {suffix}")
-    base = artifact_category_dir(category)
+    base = artifact_category_dir(category)  # refuses a category that is not a plain name
+    if not _is_plain_name(suffix):
+        raise MikException(f"invalid artifact suffix (want letters, digits, - . _): {suffix!r}")
     base.mkdir(parents=True, exist_ok=True)
     final = base / f"{rid}-{suffix}"
     if final.exists():
@@ -513,7 +526,7 @@ def _artifact_entries(category):
         if p.name.startswith("."):  # .mik-build-* staging and other hidden cruft
             continue
         head = p.name.split("-", 1)[0]
-        if head.isdigit() and all(c.isalnum() or c in "-._" for c in p.name):
+        if head.isascii() and head.isdigit() and _is_plain_name(p.name):
             entries.append((int(head), p))
     return sorted(entries, key=lambda t: t[0])
 
@@ -629,6 +642,8 @@ _valid_name_ords = (
 
 
 def validate_name(s):
+    if s.startswith("-"):  # a name goes into an argv (ssh, docker exec): there, a leading dash is an option
+        raise MikException(f"A name can't start with a dash: {s!r}")
     metone = False
     for c in s:
         if ord(c) not in _valid_name_ords:
@@ -652,7 +667,14 @@ _valid_path_ords = (
 # .githooks/, etc. — they hijack checkout/filter/hook behavior. So we deny the whole ".git" prefix and poke
 # explicit holes only for known-safe exceptions: .gitignore, .github/** (CI/workflows/templates), .gitkeep.
 # Anything else starting with ".git" is rejected by default — add it here consciously if you need it.
-FORBIDDEN_PATH_PARTS = {"node_modules", "__pycache__"}
+# What is forbidden is forbidden in any case (".GIT/hooks/x", ".Git/config"): a filesystem that ignores case
+# (macOS, Windows, a casefold directory) opens .git under those names. What is allowed is so as written only.
+# HEAD: a repository needs no ".git" in its name. Any directory that holds HEAD, objects/ and refs/ is one to
+# git (a bare one), found from anywhere under it, and its `config` is then obeyed: core.fsmonitor there is a
+# command that `git status` runs. A pod could send those four as new files, each with a harmless name. HEAD is
+# the one every such directory has to have, and the one a project has no use for — so no HEAD, no repository.
+# (FORBIDDEN_PATH_PARTS is compared with the name in lower case: keep what is in it in lower case.)
+FORBIDDEN_PATH_PARTS = {"node_modules", "__pycache__", "head"}
 FORBIDDEN_PATH_PREFIXES = (".git",)
 ALLOWED_PATH_PARTS = {".gitignore", ".github", ".gitkeep"}
 
@@ -665,15 +687,25 @@ def validate_path(p):
             return False
         if component in ALLOWED_PATH_PARTS:
             continue
-        if component in FORBIDDEN_PATH_PARTS:
+        folded = component.lower()
+        if folded in FORBIDDEN_PATH_PARTS:
             return False
         for prefix in FORBIDDEN_PATH_PREFIXES:
-            if component.startswith(prefix):
+            if folded.startswith(prefix):
                 return False
         for c in component:
             if ord(c) not in _valid_path_ords:
                 return False
     return True
+
+
+def _is_plain_name(s):
+    """True for one plain name: only [A-Za-z0-9-._], and at least one char that is not a dot (so not "", ".", "..").
+
+    The chars validate_path allows in a path component, looked up one by one in the allowlist: no regex, and
+    not str.isalnum(), which says yes to every letter and digit Unicode has ("é", "²").
+    """
+    return isinstance(s, str) and bool(s.strip(".")) and all(ord(c) in _valid_path_ords for c in s)
 
 
 _valid_code_dir_ords = (*_valid_path_ords, ord("/"))
@@ -711,6 +743,34 @@ def _flip_current_cmd(site_root, target):
     """
     tmp = f"{site_root}/.mik-cur-tmp"
     return f"ln -sfn {target} {tmp} && mv -T {tmp} {site_root}/current"
+
+
+def _owner_writes_cmd(path):
+    """The remote command after which the ssh user can read, enter and write everything under `path`.
+
+    Whatever modes a build came with: a read-only file cannot be copied over, and a read-only directory can
+    neither be filled, nor renamed into another one, nor deleted. `chmod -R` gives a directory its bits
+    before it goes into it, so one that could not even be entered is.
+    """
+    return f"chmod -R u+rwX {path}"
+
+
+def _served_modes_cmd(path):
+    """The remote command that leaves what is under `path` the way it is served: directories 755, files 444.
+
+    The modes are set, not added to, so they do not depend on what the build had or on a umask. Readable by
+    all: a containerized web server reads through the "other" bits. Files written by nobody: a release is
+    not edited in place, and a file that is has to be made writable first, which is not done by accident (it
+    stops no one who is the owner, and is not meant to). Directories stay writable by their owner, and only
+    by it: one that is not cannot be renamed into releases/ (rename(2) has to write its `..`), and `rm -rf`
+    cannot empty it. The owner is given its bits first (_owner_writes_cmd): find could not go through a
+    directory it cannot read.
+    """
+    return (
+        f"{_owner_writes_cmd(path)}"
+        f" && find {path} -type d -exec chmod 755 '{{}}' +"
+        f" && find {path} -type f -exec chmod 444 '{{}}' +"
+    )
 
 
 # What deploy_release owns under a site root, beside the `current` link. A directory's place says where it
@@ -870,7 +930,12 @@ def deploy_release(src, ssh_host, site_root, release_id, name, keep=5, merge_sec
     Runs entirely as the ssh user — *no sudo*. The web root must be owned/writable by that user (a one-time
     `chown -R <user> {site_root}`); a preflight check fails fast with that instruction if it isn't. A
     containerized web server serving from a bind mount reads files by their world-readable ("other") bits
-    regardless of host ownership, which is why everything is `chmod -R a+rX`'d before it's served.
+    regardless of host ownership, which is why what is served is readable by all.
+
+    Modes. Whatever the build had, a release ends as directories 755 and files 444 (see _served_modes_cmd),
+    and so does a merge. While it is put together, everything in a merge is writable by the ssh user: the
+    files copied from an earlier release come read-only, and the next one copied over them has to replace
+    them. So a build with read-only files, or read-only directories, deploys like any other.
 
     What is on the remote. Four directories under {site_root}, all mik's own, and where a directory is
     says where it stands:
@@ -983,7 +1048,10 @@ def deploy_release(src, ssh_host, site_root, release_id, name, keep=5, merge_sec
             answer = ""
         if answer.strip().lower() != "y":
             raise MikException(f"not deploying {name}: unfinished deploy left in {site_root} ({', '.join(unfinished)})")
-        run_step(["ssh", ssh_host, "rm -rf " + " ".join(f"{site_root}/{path}" for path in unfinished)])
+        # made writable first: an upload that stopped halfway may hold a read-only directory, as the build
+        # had it, and `rm -rf` cannot empty one
+        left = " ".join(f"{site_root}/{path}" for path in unfinished)
+        run_step(["ssh", ssh_host, f"{_owner_writes_cmd(left)} && rm -rf {left}"])
     # 3. what is to be merged, and whether it can be: the earlier releases are listed (read-only) and
     #    compared, here, with one another and with the artifact. A clash would make the merge fail at every
     #    try, so it is refused now, while nothing has been uploaded.
@@ -1013,19 +1081,21 @@ def deploy_release(src, ssh_host, site_root, release_id, name, keep=5, merge_sec
     # 4. ship the built artifact as-is (scp = argv, no shell). releasing/ is empty by now, so the directory
     #    scp makes is the artifact itself.
     run_step(["scp", "-r", str(src), f"{ssh_host}:{releasing_dir}/{rid}"])
-    # 5. get ready, beside what is served: the upload made world-readable (a containerized server reads by
-    #    'other' bits) and, when merging, the merge — the earlier releases copied in from oldest to newest and
-    #    this one last, so that it wins on shared names.
-    ready = [f"chmod -R a+rX {releasing_dir}/{rid}"]
+    # 5. get ready, beside what is served: the upload given the modes it is served with (directories 755,
+    #    files 444) and, when merging, the merge — the earlier releases copied in from oldest to newest and
+    #    this one last, so that it wins on shared names. What was copied is made writable before the next one
+    #    is copied over it (a copy of a read-only file is read-only), and the merge gets its modes at the end.
+    ready = [_served_modes_cmd(f"{releasing_dir}/{rid}")]
     go_live = [f"rm -rf {releases_dir}/{rid}", f"mv -T {releasing_dir}/{rid} {releases_dir}/{rid}"]
     target = f"releases/{rid}"
     if merge_seconds > 0:
-        ready += [
-            f"mkdir {merging_dir}/{rid}",
-            *[f"cp -rL {releases_dir}/{entry}/. {merging_dir}/{rid}/" for entry in merging],
-            f"cp -rL {releasing_dir}/{rid}/. {merging_dir}/{rid}/",
-            f"chmod -R a+rX {merging_dir}/{rid}",
-        ]
+        ready += [f"mkdir {merging_dir}/{rid}"]
+        for entry in merging:
+            ready += [
+                f"cp -rL {releases_dir}/{entry}/. {merging_dir}/{rid}/",
+                _owner_writes_cmd(f"{merging_dir}/{rid}"),
+            ]
+        ready += [f"cp -rL {releasing_dir}/{rid}/. {merging_dir}/{rid}/", _served_modes_cmd(f"{merging_dir}/{rid}")]
         go_live += [f"rm -rf {merged_dir}/{rid}", f"mv -T {merging_dir}/{rid} {merged_dir}/{rid}"]
         target = f"merged/{rid}"
     run_step(["ssh", ssh_host, " && ".join(ready)])
@@ -1054,7 +1124,7 @@ _vpo = (
     *range(ord("A"), ord("Z") + 1), *range(ord("a"), ord("z") + 1),
     *range(ord("0"), ord("9") + 1), ord("-"), ord("."), ord("_"),
 )
-_forbidden_parts = {"node_modules", "__pycache__"}
+_forbidden_parts = {"node_modules", "__pycache__", "head"}
 _forbidden_prefixes = (".git",)
 _allowed_parts = {".gitignore", ".github", ".gitkeep"}
 def validate_path(p):
@@ -1065,10 +1135,11 @@ def validate_path(p):
             return False
         if comp in _allowed_parts:
             continue
-        if comp in _forbidden_parts:
+        folded = comp.lower()
+        if folded in _forbidden_parts:
             return False
         for pfx in _forbidden_prefixes:
-            if comp.startswith(pfx):
+            if folded.startswith(pfx):
                 return False
         for c in comp:
             if ord(c) not in _vpo:
@@ -1159,6 +1230,29 @@ def _checked_remote_files(files):
     # Made again from the two checked fields: this list goes back into the fetch script, and anything else a
     # pod put beside them has no business travelling with it.
     return [{"path": f["path"], "status": f["status"]} for f in files]
+
+
+def _local_destinations(local_repo, files):
+    """{path: where it lands in the local repo} for the files a pod listed — refused if a symlink is on the way.
+
+    validate_path keeps a path inside the repo as a name; a symlink already in the local repo (`vendor ->
+    /somewhere/else`, one that is tracked, one that came with a pull) would still take `vendor/x` out of
+    it, for a write as for a deletion. So every component is looked at, the last one included: nothing is
+    written or deleted through a link, and a link is not replaced either. Whatever local_repo itself is, it is
+    the config's to say.
+    """
+    dests = {}
+    for f in files:
+        dest = Path(local_repo)
+        for component in f["path"].split("/"):
+            dest = dest / component
+            if dest.is_symlink():
+                raise MikException(
+                    f"Refusing {f['path']}: {dest} is a symlink in the local repo, and mik neither writes nor "
+                    f"deletes through one. Nothing was fetched."
+                )
+        dests[f["path"]] = dest
+    return dests
 
 
 def _checked_remote_contents(payload, files):
@@ -1259,6 +1353,7 @@ def dev_fetch_pod(args):
     if not files:
         print("No changes found.")
         return
+    dests = _local_destinations(local_repo, files)  # no symlink on the way, checked before the question is asked
     # Display
     for f in files:
         color = Color.RED.value if f["status"] == "D" else Color.GREEN.value
@@ -1282,11 +1377,10 @@ def dev_fetch_pod(args):
     # Preemptive check — reject entire response if it is not exactly the confirmed list, contents decoded
     contents, deleted_paths = _checked_remote_contents(payload, files)
     # Apply
-    local = Path(local_repo)
     written = 0
     deleted = 0
     for fpath, content in contents.items():
-        dest = local / fpath
+        dest = dests[fpath]
         dest.parent.mkdir(parents=True, exist_ok=True)
         # Atomic write: same-dir temp + replace, so a failure mid-fetch can't leave a truncated file.
         fd, tmp_path = tempfile.mkstemp(dir=dest.parent, prefix=f".{dest.name}.", suffix=".tmp")
@@ -1311,7 +1405,7 @@ def dev_fetch_pod(args):
         print(f"  {Color.GREEN.value}wrote{Color.WHITE.value}  {fpath}")
         written += 1
     for fpath in deleted_paths:
-        dest = local / fpath
+        dest = dests[fpath]
         if dest.exists():
             dest.unlink()
             print(f"  {Color.RED.value}deleted{Color.WHITE.value}  {fpath}")
@@ -1484,6 +1578,15 @@ def _split_github_repo(github_repo):
     return parts[0], parts[1]
 
 
+def _is_plain_branch(branch):
+    """True for a branch name that can go into the API URL as it is: plain names ([A-Za-z0-9-._]) between "/".
+
+    The name is what the API answered, and whoever owns the repo chose it. git allows far more in one ("#",
+    "%", any Unicode letter); none of that is quoted or guessed at here — such a branch is not checked.
+    """
+    return isinstance(branch, str) and all(_is_plain_name(part) for part in branch.split("/"))
+
+
 def _rollup_check_runs(check_runs):
     """Aggregate a commit's check-runs into a single state, mirroring GitHub's green-check/red-cross."""
     if not check_runs:
@@ -1504,6 +1607,9 @@ def _fetch_ci_status(name, github_repo):
         branch = info.get("default_branch")
         if not branch:
             return {"name": name, "branch": None, "state": CI_FETCH_ERROR, "detail": "no default branch"}
+        if not _is_plain_branch(branch):
+            detail = f"unsupported default branch name: {branch!r}"
+            return {"name": name, "branch": None, "state": CI_FETCH_ERROR, "detail": detail}
         data = _github_get_json(f"/repos/{owner}/{repo}/commits/{branch}/check-runs")
         return {"name": name, "branch": branch, "state": _rollup_check_runs(data.get("check_runs", [])), "detail": ""}
     except MikException as exc:

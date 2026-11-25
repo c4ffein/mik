@@ -71,6 +71,33 @@ class ValidatePathTests(unittest.TestCase):
         for p in ("a b.txt", "a;rm.txt", "a$b", "a\tb"):
             self.assertFalse(mik.validate_path(p), p)
 
+    _ANY_CASE = (".GIT/hooks/pre-commit", ".Git/config", "sub/.gIt/config", ".GITMODULES", ".GitAttributes")
+
+    def test_what_is_forbidden_is_forbidden_in_any_case(self):
+        # A filesystem that ignores case opens .git under these names. What is allowed is so as written only.
+        for p in (*self._ANY_CASE, "Node_Modules/x", "a/__PYCACHE__/b.pyc", ".GITHUB/workflows/ci.yml", ".GitIgnore"):
+            self.assertFalse(mik.validate_path(p), p)
+
+    def test_no_head_so_no_repository_inside_the_repository(self):
+        # HEAD + objects/ + refs/ is a repository to git, whatever the directory is called, and its `config`
+        # is obeyed (core.fsmonitor runs on `git status`). Without HEAD there is none.
+        for p in ("tools/x/HEAD", "HEAD", "head", "a/Head", "HEAD/x", "a/HEAD/b.txt"):
+            self.assertFalse(mik.validate_path(p), p)
+        for p in ("tools/x/config", "tools/x/objects/a", "tools/x/refs/a", "HEAD.md", "header.py", "ahead", "a/HEADS"):
+            self.assertTrue(mik.validate_path(p), p)
+
+    def test_the_copy_that_runs_in_the_pod_says_the_same(self):
+        # _REMOTE_VALIDATE_PATH is validate_path again, as source text: the two must not drift apart.
+        pod = {}
+        exec(mik._REMOTE_VALIDATE_PATH, pod)
+        for p in (
+            *("a.txt", "src/main.py", ".gitignore", ".github/workflows/ci.yml", "sub/.gitkeep", "-a/b_c.d"),
+            *("/etc/passwd", "../x", "a/../b", "", "a//b", ".git/config", ".gitmodules", "node_modules/x"),
+            *("a b", "a$b", "é.txt", ".GITHUB/x", "Node_Modules/x", *self._ANY_CASE),
+            *("tools/x/HEAD", "head", "a/Head/b", "HEAD.md", "tools/x/config", "tools/x/objects/a"),
+        ):
+            self.assertEqual(pod["validate_path"](p), mik.validate_path(p), p)
+
 
 def _tar_with(*members):
     """A .tar.gz BytesIO from (TarInfo, payload-or-None) pairs — payload only for regular files."""
@@ -166,6 +193,13 @@ class ValidateNameTests(unittest.TestCase):
             with self.assertRaises(Exception):
                 mik.validate_name(n)
 
+    def test_rejects_a_leading_dash(self):
+        # A name goes into an argv (ssh, docker exec), where this would be read as an option.
+        for n in ("-oFoo", "-F.evil", "--privileged", "-"):
+            with self.assertRaises(mik.MikException):
+                mik.validate_name(n)
+        mik.validate_name("a-b-")  # a dash elsewhere is fine
+
 
 class ValidateCodeDirTests(unittest.TestCase):
     def test_accepts(self):
@@ -206,7 +240,30 @@ class DeployTests(unittest.TestCase):
     def test_runs_joined_script_and_records(self):
         with mock.patch.object(mik, "run_recorded", return_value=(0, "ok")) as rr:
             mik.deploy(SimpleNamespace(instance="web"))
-        rr.assert_called_once_with("deploy", "web", "cd /srv\nmake", "/bin/sh")
+        rr.assert_called_once_with("deploy", "web", "set -e\ncd /srv\nmake", "/bin/sh")
+
+    def test_another_interpreter_gets_the_lines_as_they_are(self):
+        # `set -e` is only said to a shell that knows it: deploy_shell may be any interpreter.
+        mik.instances_dict["py"] = _inst("py", deploy=["print(1)"], deploy_shell="/usr/bin/python3")
+        with mock.patch.object(mik, "run_recorded", return_value=(0, "ok")) as rr:
+            mik.deploy(SimpleNamespace(instance="py"))
+        rr.assert_called_once_with("deploy", "py", "print(1)", "/usr/bin/python3")
+
+    def test_a_line_that_fails_stops_the_deploy_there(self):
+        # The real shell: `cd` fails, and what comes after must not run from wherever the shell was.
+        for shell in (None, "/bin/sh"):
+            lines = ["cd /nonexistent-mik-test", "echo REACHED"]
+            mik.instances_dict["web"] = _inst("web", deploy=lines, deploy_shell=shell)
+            out = io.BytesIO()
+            with (
+                self.subTest(shell=shell),
+                mock.patch.object(mik, "record_run") as recorded,
+                mock.patch.object(mik.sys, "stdout", SimpleNamespace(buffer=out, flush=lambda: None)),
+            ):
+                with self.assertRaises(mik.MikException):
+                    mik.deploy(SimpleNamespace(instance="web"))
+                self.assertNotEqual(recorded.call_args.args[4], 0)  # the return code that was recorded
+                self.assertNotIn(b"REACHED", out.getvalue())
 
     def test_nonzero_returncode_raises(self):
         with mock.patch.object(mik, "run_recorded", return_value=(2, "boom")):
@@ -257,6 +314,56 @@ class RunAndCaptureTests(unittest.TestCase):
     def test_nonzero_returncode(self):
         rc, out = mik.run_and_capture("exit 3", "/bin/sh")
         self.assertEqual(rc, 3)
+
+
+class ArtifactNameTests(unittest.TestCase):
+    """What names an artifact: chars from the allowlist ([A-Za-z0-9-._]) and nothing else."""
+
+    _BAD = ("", ".", "..", "a/b", "../x", "a b", "é", "dist²", "a;b", "a$b", "a\n", None, 5)
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.store = Path(self._tmp.name) / "artifacts"
+        self.store.mkdir()
+        patcher = mock.patch.object(mik, "ARTIFACTS_DIR", self.store)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_a_category_is_one_plain_name(self):
+        for category in self._BAD:
+            for helper in (mik.artifact_category_dir, mik.latest_release, mik.prune_artifacts):
+                with self.subTest(category=category, helper=helper.__name__), self.assertRaises(mik.MikException):
+                    helper(category)
+            with self.subTest(category=category, helper="resolve_release"), self.assertRaises(mik.MikException):
+                mik.resolve_release(category, "1")
+            with self.subTest(category=category, helper="build_artifact"), self.assertRaises(mik.MikException):
+                mik.build_artifact(category, "dist", lambda staging: staging.mkdir())
+        self.assertEqual(os.listdir(self._tmp.name), ["artifacts"])  # nothing made beside the store
+        self.assertEqual(os.listdir(self.store), [])
+        self.assertEqual(mik.artifact_category_dir("my-site_1.dist"), self.store / "my-site_1.dist")
+
+    def test_a_suffix_is_one_plain_name_and_a_release_id_is_ascii_digits(self):
+        built = []
+        for suffix in self._BAD:
+            with self.subTest(suffix=suffix), self.assertRaises(mik.MikException):
+                mik.build_artifact("site", suffix, built.append)
+        for release_id in ("²", "١٢٣", "12a", "-1", ""):
+            with self.subTest(release_id=release_id), self.assertRaises(mik.MikException):
+                mik.build_artifact("site", "dist", built.append, release_id=release_id)
+        self.assertEqual(built, [])  # build() never ran
+        final = mik.build_artifact("site", "dist", lambda staging: staging.mkdir(), release_id=1750000000)
+        self.assertEqual(final, self.store / "site" / "1750000000-dist")
+
+    def test_an_entry_with_another_name_is_not_a_release(self):
+        # isdigit() says yes to "²" and int() then refuses it: such a name is skipped, like any odd one.
+        base = self.store / "site"
+        for entry in ("100-dist", "200-dist", "²-dist", "١٢٣-dist", "300-é", "400 dist", ".mik-build-500-dist"):
+            (base / entry).mkdir(parents=True)
+        self.assertEqual(mik.latest_release("site"), base / "200-dist")
+        self.assertEqual(mik.resolve_release("site", "100"), base / "100-dist")
+        self.assertEqual(mik.prune_artifacts("site", keep=1), [base / "100-dist"])
+        self.assertEqual(len(os.listdir(base)), 6)  # only the release that was pruned is gone
 
 
 class RecordRunTests(unittest.TestCase):
@@ -424,6 +531,8 @@ class DevFetchPodTests(unittest.TestCase):
             {"path": "../outside.txt", "status": "M"},
             {"path": "/etc/outside.txt", "status": "M"},
             {"path": ".git/hooks/pre-commit", "status": "A"},
+            {"path": ".GIT/hooks/pre-commit", "status": "A"},
+            {"path": "tools/x/HEAD", "status": "A"},  # with objects/ and refs/ beside it: a repository to git
             {"path": "a\033[2K.txt", "status": "M"},  # an escape sequence, to rewrite what is shown
             {"path": 'hello" : " \\" \\ "', "status": "A"},  # quotes and backslashes, to get out of a string
             {"path": 'a"]; import os; os.system("id") #', "status": "A"},
@@ -449,6 +558,56 @@ class DevFetchPodTests(unittest.TestCase):
                         mik.dev_fetch_pod(SimpleNamespace(instance="inst"))
                 self.assertEqual(remote.call_count, 1)  # never got to the fetch
                 self.assertEqual(list(Path(d).rglob("*")), [repo])  # nothing written, inside or outside
+
+    def test_nothing_is_written_or_deleted_through_a_local_symlink(self):
+        # validate_path keeps a path inside the repo as a name; a symlink already there would take it out.
+        for name, path, status in (
+            ("a new file under a linked directory", "vendor/.bashrc", "A"),
+            ("deeper under a linked directory", "vendor/sub/x.txt", "M"),
+            ("a deletion under a linked directory", "vendor/precious.txt", "D"),
+            ("the file itself is a link", "link.txt", "M"),
+            ("the deleted file itself is a link", "link.txt", "D"),
+        ):
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as d:
+                repo, outside = Path(d) / "repo", Path(d) / "outside"
+                repo.mkdir()
+                (outside / "sub").mkdir(parents=True)
+                (outside / "precious.txt").write_text("keep me")
+                (repo / "vendor").symlink_to(outside)
+                (repo / "link.txt").symlink_to(outside / "precious.txt")
+                before = sorted(str(x) for x in Path(d).rglob("*"))
+                self._setup(str(repo))
+                files = [{"path": "ok.txt", "status": "M"}, {"path": path, "status": status}]
+                list_resp = json.dumps({"files": files, "errors": []}).encode()
+                asked = mock.Mock(side_effect=AssertionError("asked a question"))
+                with (
+                    mock.patch.object(mik, "_run_remote_script", side_effect=[(0, b"", list_resp)]) as remote,
+                    mock.patch("builtins.input", asked),
+                    mock.patch("builtins.print"),
+                ):
+                    with self.assertRaises(mik.MikException) as ctx:
+                        mik.dev_fetch_pod(SimpleNamespace(instance="inst"))
+                self.assertIn("symlink", str(ctx.exception))
+                self.assertEqual(remote.call_count, 1)  # never got to the fetch
+                self.assertEqual(sorted(str(x) for x in Path(d).rglob("*")), before)  # nothing written or deleted
+                self.assertEqual((outside / "precious.txt").read_text(), "keep me")
+                self.assertTrue((repo / "link.txt").is_symlink())
+
+    def test_a_local_repo_that_is_itself_a_symlink_is_the_configs_to_say(self):
+        list_resp = json.dumps({"files": [{"path": "sub/a.txt", "status": "A"}], "errors": []}).encode()
+        fetch_payload = {"files": {"sub/a.txt": mik.base64.b64encode(b"hello").decode()}, "deleted": []}
+        fetch_resp = mik.base64.b64encode(json.dumps(fetch_payload).encode())
+        with tempfile.TemporaryDirectory() as d:
+            (Path(d) / "real").mkdir()
+            (Path(d) / "repo").symlink_to(Path(d) / "real")
+            self._setup(str(Path(d) / "repo"))
+            with (
+                mock.patch.object(mik, "_run_remote_script", side_effect=[(0, b"", list_resp), (0, b"", fetch_resp)]),
+                mock.patch("builtins.input", return_value="y"),
+                mock.patch("builtins.print"),
+            ):
+                mik.dev_fetch_pod(SimpleNamespace(instance="inst"))
+            self.assertEqual((Path(d) / "real" / "sub" / "a.txt").read_bytes(), b"hello")
 
     def test_only_the_path_and_the_status_go_back_to_the_pod(self):
         # What a pod puts beside them is dropped: the confirmed list is written into the fetch script.
@@ -883,6 +1042,28 @@ class CiStatusTests(unittest.TestCase):
         with mock.patch.object(mik, "_github_get_json", side_effect=fake):
             self.assertEqual(mik.ci_status(SimpleNamespace(project="p")), 1)
 
+    def test_a_branch_name_that_is_not_plain_does_not_go_into_the_url(self):
+        # The default branch is what the API answered: only chars from the allowlist are put in a URL.
+        for branch in ("dév", "a#b", "a?b=c", "a b", "../../users/x", "a//b", "/a", "a/", ".", "a%2fb", 5, ["main"]):
+            self._proj("p", "o/r")
+            fake = mock.Mock(side_effect=fake_github({"/repos/o/r": {"default_branch": branch}}))
+            with self.subTest(branch=branch), mock.patch.object(mik, "_github_get_json", fake):
+                result = mik._fetch_ci_status("p", "o/r")
+                self.assertEqual(result["state"], mik.CI_FETCH_ERROR)
+                self.assertIn("unsupported default branch name", result["detail"])
+                fake.assert_called_once_with("/repos/o/r")  # nothing was asked about that branch
+
+    def test_a_plain_branch_name_goes_into_the_url(self):
+        for branch in ("main", "release/1.0", "feat/a-b_c.d"):
+            self._proj("p", "o/r")
+            runs = {"check_runs": [{"status": "completed", "conclusion": "success"}]}
+            fake = mock.Mock(
+                side_effect=fake_github({"/repos/o/r": {"default_branch": branch}, "/repos/o/r/commits/": runs})
+            )
+            with self.subTest(branch=branch), mock.patch.object(mik, "_github_get_json", fake):
+                self.assertEqual(mik._fetch_ci_status("p", "o/r")["state"], mik.CI_GOOD)
+                fake.assert_called_with(f"/repos/o/r/commits/{branch}/check-runs")
+
     def test_missing_github_repo_raises(self):
         self._proj("p", None)
         with self.assertRaises(mik.MikException):
@@ -984,7 +1165,7 @@ class DeployReleaseTests(unittest.TestCase):
 
     def _ready(self, cmds):
         """The command that gets the upload ready beside what is served (and makes the merge)."""
-        return cmds[self._idx(cmds, f"chmod -R a+rX {self.S}/releasing/123")]
+        return cmds[self._idx(cmds, f"chmod -R u+rwX {self.S}/releasing/123")]
 
     # Three releases on the remote: two from before the last day (only the newer of them was still live
     # when the day began) and one from within it.
@@ -1016,16 +1197,22 @@ class DeployReleaseTests(unittest.TestCase):
         self.assertEqual([look, held, scp, ready, live, cleanup], [0, 1, 2, 3, 4, 5])
         self.assertEqual(len(cmds), 6)
 
-        # getting ready: the upload made world-readable, then the merge — the release that was live when the
-        # day began, the one from within the day, and the new one LAST so it wins on shared names. 100 was
-        # already replaced before the day began: left out.
+        # getting ready: the upload given the modes it is served with, then the merge — the release that was
+        # live when the day began, the one from within the day, and the new one LAST so it wins on shared
+        # names. 100 was already replaced before the day began: left out.
         built = cmds[ready]
-        self.assertTrue(built.startswith(f"ssh user@host chmod -R a+rX {self.S}/releasing/123 && "))
-        sources = [f"{self.R}/105", f"{self.R}/110", f"{self.S}/releasing/123"]
-        copies = [built.index(f"cp -rL {source}/. {self.S}/merging/123/") for source in sources]
+        up, merge = f"{self.S}/releasing/123", f"{self.S}/merging/123"
+        modes = "chmod -R u+rwX {0} && find {0} -type d -exec chmod 755 '{{}}' + && find {0} -type f -exec chmod 444 '{{}}' +"
+        self.assertTrue(built.startswith(f"ssh user@host {modes.format(up)} && mkdir {merge} && "))
+        sources = [f"{self.R}/105", f"{self.R}/110", up]
+        copies = [built.index(f"cp -rL {source}/. {merge}/") for source in sources]
         self.assertEqual(copies, sorted(copies))
         self.assertNotIn(f"{self.R}/100/", built)
-        self.assertTrue(built.endswith(f"chmod -R a+rX {self.S}/merging/123"))
+        # a copy of a read-only file is read-only: made writable before the next release is copied over it
+        for source in sources:
+            self.assertIn(f"cp -rL {source}/. {merge}/ && chmod -R u+rwX {merge}", built)
+        self.assertTrue(built.endswith(f"cp -rL {up}/. {merge}/ && {modes.format(merge)}"))
+        self.assertNotIn("a+rX", built)
         self.assertNotIn("ln -sfn", built)  # nothing that is served is touched while getting ready
 
         # going live is ONE command: both directories take their names, then `current` flips (an atomic
@@ -1117,7 +1304,8 @@ class DeployReleaseTests(unittest.TestCase):
         survey = self._survey("merged/110", self.HISTORY, merged=["110"], unfinished=left)
         # agreed: deleted before anything is uploaded, then the deploy goes on
         _, cmds, printed, _ = self._deploy(survey, answer=["y"])
-        self.assertEqual(cmds[1], f"ssh user@host rm -rf {self.S}/releasing/120 {self.S}/merging/120")
+        left_there = f"{self.S}/releasing/120 {self.S}/merging/120"
+        self.assertEqual(cmds[1], f"ssh user@host chmod -R u+rwX {left_there} && rm -rf {left_there}")
         self.assertIn("find 105 110", cmds[2])
         self.assertIn("scp -r", cmds[3])
         self.assertTrue(any("did not finish" in line for line in printed))
@@ -1352,13 +1540,19 @@ class DeployReleaseOnDiskTests(unittest.TestCase):
             patcher.start()
             self.addCleanup(patcher.stop)
 
-    def _ship(self, rid, files, answer=None, **kwargs):
-        """Build an artifact holding `files` ({name: text}) and deploy it as release `rid`."""
+    def _ship(self, rid, files, answer=None, modes=None, **kwargs):
+        """Build an artifact holding `files` ({name: text}) and deploy it as release `rid`.
+
+        `modes` is (mode of its directories, mode of its files), for a build that comes with modes of its own.
+        """
         src = self.tmp / f"build-{rid}"
         shutil.rmtree(src, ignore_errors=True)
         for name, text in files.items():
             (src / name).parent.mkdir(parents=True, exist_ok=True)
             (src / name).write_text(text)
+        if modes:
+            for p in [*sorted(src.rglob("*"), reverse=True), src]:  # what is inside a directory before it
+                os.chmod(p, modes[0] if p.is_dir() else modes[1])
         asked = mock.Mock(side_effect=AssertionError("asked a question") if answer is None else [answer])
         with mock.patch("builtins.input", asked):
             mik.deploy_release(src, "user@host", str(self.site), release_id=rid, name="site", **kwargs)
@@ -1391,6 +1585,64 @@ class DeployReleaseOnDiskTests(unittest.TestCase):
         self.assertEqual((self._there("releasing"), self._there("merging")), ([], []))
         # readable by a server that is not the owner
         self.assertTrue(all(p.stat().st_mode & 0o004 for p in (self.site / "merged" / "2").rglob("*")))
+
+    def _modes(self, where):
+        """{"d": modes of the directories under site/`where`, "f": modes of the files}, the directory included."""
+        found = {"d": set(), "f": set()}
+        for p in [self.site / where, *(self.site / where).rglob("*")]:
+            found["d" if p.is_dir() else "f"].add(oct(p.stat().st_mode & 0o7777))
+        return found
+
+    def test_what_is_served_is_755_and_444_whatever_the_build_and_the_umask(self):
+        files = {"index.html": "one", "assets/a.1.js": "a1"}
+        for umask, modes in ((0o022, (0o777, 0o777)), (0o077, (0o700, 0o600)), (0o002, (0o775, 0o664))):
+            old = os.umask(umask)
+            try:
+                self._ship("1", files, modes=modes)
+            finally:
+                os.umask(old)
+            for where in ("releases/1", "merged/1"):
+                with self.subTest(umask=oct(umask), where=where):
+                    self.assertEqual(self._modes(where), {"d": {"0o755"}, "f": {"0o444"}})
+            shutil.rmtree(self.site)
+            self.site.mkdir()
+
+    def test_a_build_with_read_only_files_and_directories_deploys_again_and_again(self):
+        # cp cannot write over a read-only file, and a read-only directory can be neither filled, nor renamed
+        # into releases/, nor deleted: none of that is left to the modes the build happened to have.
+        for modes in ((0o755, 0o444), (0o555, 0o444)):
+            with self.subTest(modes=[oct(m) for m in modes]):
+                self._ship("1", {"index.html": "one", "assets/a.1.js": "a1"}, modes=modes)
+                self._ship("2", {"index.html": "two", "assets/a.2.js": "a2"}, modes=modes)
+                self._ship("3", {"index.html": "three", "assets/a.3.js": "a3"}, modes=modes)
+                self.assertEqual(os.readlink(self.site / "current"), "merged/3")
+                served = {"index.html": "three", "assets/a.1.js": "a1", "assets/a.2.js": "a2", "assets/a.3.js": "a3"}
+                self.assertEqual(self._served(), served)
+                self.assertEqual((self._there("releasing"), self._there("merging")), ([], []))
+                self.assertEqual(self._modes("merged/3"), {"d": {"0o755"}, "f": {"0o444"}})
+                # and what is no longer needed gets deleted: 1 is far enough back to go
+                self._age("1", 3 * 86400)
+                self._age("2", 2 * 86400)
+                self._age("3", 86400 + 60)
+                self._ship("4", {"index.html": "four"}, modes=modes, keep=1)
+                self._ship("5", {"index.html": "five"}, modes=modes, keep=1)
+                self.assertNotIn("1", self._there("releases"))
+                self.assertEqual(self._there("merged"), ["4", "5"])
+            subprocess.run(["chmod", "-R", "u+rwX", str(self.tmp)], check=True)
+            for left in self.tmp.iterdir():
+                shutil.rmtree(left)
+            self.site.mkdir()
+
+    def test_what_a_read_only_upload_left_halfway_can_be_deleted(self):
+        self._ship("1", {"index.html": "one"})
+        left = self.site / "releasing" / "9"
+        (left / "assets").mkdir(parents=True)
+        (left / "assets" / "a.js").write_text("a")
+        for p in (left / "assets" / "a.js", left / "assets", left):
+            os.chmod(p, 0o444 if p.is_file() else 0o555)
+        self._ship("2", {"index.html": "two"}, answer="y")
+        self.assertEqual((self._there("releasing"), self._there("merging")), ([], []))
+        self.assertEqual(self._served(), {"index.html": "two"})
 
     def test_a_file_leaves_when_its_release_leaves_the_window(self):
         self._ship("1", {"index.html": "one", "a.1.js": "a1"})
