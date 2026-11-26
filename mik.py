@@ -1216,6 +1216,16 @@ def _printable(s):
     return "".join(c for c in str(s) if c.isprintable())
 
 
+def _is_dot_path(path):
+    """True for a path with a name that starts with a dot in it (".envrc", ".vscode/tasks.json", "a/.hg/hgrc").
+
+    Such a name is where tools keep what they read without being asked, and some of it they run: an editor's
+    tasks, a hook manager's hooks, another version control's config, CI workflows. `ls` does not show them, and
+    in a long list they are easy to read past — so dev-fetch-pod shows them in red before it asks.
+    """
+    return any(component.startswith(".") for component in path.split("/"))
+
+
 def _checked_remote_files(files):
     """The file list a pod sent, refused as a whole unless every entry is a plain path inside the repo.
 
@@ -1258,6 +1268,10 @@ def _local_destinations(local_repo, files):
     one; but a bare repository the local repo already holds (a test fixture, `fixtures/x.git`) has its HEAD,
     and its `config` and `hooks/` are plain names. So a directory on the way that holds a HEAD is refused.
 
+    Nor into one that has its own `.git` (a clone kept inside the local repo, a `git worktree`, a submodule):
+    to the local repo that whole directory is one line of `git status` at most, the same before and after —
+    what a pod wrote in it would be shown by neither `git status` nor `git diff` there.
+
     And what is there has to be what the path says: directories on the way, a regular file at the end (or
     nothing yet). Found here, before the question is asked, rather than by a write that fails halfway.
     """
@@ -1277,6 +1291,12 @@ def _local_destinations(local_repo, files):
                     raise MikException(
                         f"Refusing {f['path']}: {dest} holds a HEAD, which makes it a repository to git (its "
                         f"config and hooks are obeyed), and mik writes nothing into one. Nothing was fetched."
+                    )
+                if os.path.lexists(dest / ".git"):
+                    raise MikException(
+                        f"Refusing {f['path']}: {dest} holds a .git, which makes it a repository of its own (a "
+                        f"clone, a worktree, a submodule): `git status` in {local_repo} would not show what was "
+                        f"written in it. Nothing was fetched."
                     )
                 if dest.exists() and not dest.is_dir():
                     raise MikException(f"Refusing {f['path']}: {dest} is not a directory here. Nothing was fetched.")
@@ -1361,6 +1381,39 @@ def _locally_ignored(local_repo, paths, coming=None):
         refuse(asked)
     ignored = {os.fsdecode(path) for path in asked.stdout.split(b"\0") if path}
     return [path for path in paths if prefix + path in ignored]
+
+
+def _locally_unwatched(local_repo, paths):
+    """Those of `paths` that git was told not to look at in the local repo, in their order.
+
+    `git update-index --skip-worktree` (a sparse checkout sets it too) and `--assume-unchanged` are flags on a
+    tracked file, kept in the index: from then on `git status` and `git diff` say nothing of what happens to
+    it. It is not ignored — `git check-ignore` has nothing to say of a tracked file — so this is asked apart,
+    of `git ls-files -v`: a tag `S` is skip-worktree, a tag in lower case is assume-unchanged (`s` is both).
+    Such a file is one where you keep a change of your own out of sight; a pod that lists it would replace
+    that change, and what it wrote would not be shown either. So it is refused.
+
+    The whole index is listed and compared here (NUL-ended, so a name may hold anything): no path a pod sent
+    becomes an argument. A pod cannot set these flags — they are in .git — so this is asked once, before the
+    question. As for _locally_ignored: if git cannot be asked, nothing is fetched.
+    """
+    if not paths:
+        return []
+    try:
+        asked = subprocess.run(["git", "-C", str(local_repo), "ls-files", "-v", "-z"], capture_output=True)
+    except OSError as exc:
+        raise MikException(f"could not run git to ask what {local_repo} tracks: {exc}. Nothing was fetched.") from exc
+    if asked.returncode != 0:
+        raise MikException(
+            f"could not ask git what {local_repo} tracks (rc={asked.returncode}), is it a git repository? "
+            f"Nothing was fetched.\n{_printable_lines(asked.stderr)}"
+        )
+    unwatched = set()
+    for record in asked.stdout.split(b"\0"):
+        tag, _, path = os.fsdecode(record).partition(" ")
+        if path and (tag == "S" or tag.islower()):
+            unwatched.add(path)
+    return [path for path in paths if path in unwatched]
 
 
 def _checked_remote_contents(payload, files):
@@ -1507,12 +1560,26 @@ def dev_fetch_pod(args):
             f"`git diff` would not show what was done to them, and a pod has no reason to list what is "
             f"ignored. Nothing was fetched."
         )
+    unwatched = _locally_unwatched(local_repo, [f["path"] for f in files])
+    if unwatched:
+        raise MikException(
+            f"Refusing the remote file list: git was told not to look at {', '.join(unwatched)} in the local "
+            f"repo (git update-index --skip-worktree or --assume-unchanged). `git status` and `git diff` would "
+            f"not show what was done to them, and what you keep there would be replaced. Nothing was fetched."
+        )
     # Display
     for f in files:
         color = Color.RED.value if f["status"] == "D" else Color.GREEN.value
         label = {"M": "modified", "A": "new", "D": "deleted"}.get(f["status"], f["status"])
-        print(f"  {color}{label:>10}{Color.WHITE.value}  {f['path']}")
+        shown = f"{Color.RED.value}{f['path']}{Color.WHITE.value}" if _is_dot_path(f["path"]) else f["path"]
+        print(f"  {color}{label:>10}{Color.WHITE.value}  {shown}")
     print(f"\n  {len(files)} file(s)")
+    dotted = sum(_is_dot_path(f["path"]) for f in files)
+    if dotted:
+        print(
+            f"  {Color.RED.value}{dotted} under a name that starts with a dot (in red){Color.WHITE.value}: tools "
+            f"read those without being asked, and may run what is in them"
+        )
     answer = input("\nApply these changes? [y/N] ")
     if answer.strip().lower() != "y":
         print("Aborted.")

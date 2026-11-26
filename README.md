@@ -158,10 +158,17 @@ git would not show there is refused: `local_repo` has to be a git repository, an
 ignores (`.venv/…`, `.env`: asked of `git check-ignore`, tracked files are not ignored) is not
 written or deleted. That is asked twice: before the question, with the `.gitignore` files that
 are there, and again before the first write, with those that came — so a pod cannot send a file
-together with the `.gitignore` that hides it. Nothing is written into a directory that holds a
-`HEAD` either (a bare repository already in the local repo, a test fixture), a path may be listed
-once and not as both a file and a directory, and a pod's answer is at most
+together with the `.gitignore` that hides it. A tracked file that git was told not to look at
+(`git update-index --skip-worktree` or `--assume-unchanged`) is refused as well: a change to it
+would show in neither, and it is where you keep one of your own. Nothing is written into a directory that holds a
+`HEAD` either (a bare repository already in the local repo, a test fixture), nor into one that has
+its own `.git` (a clone, a worktree, a submodule: `git status` in the local repo does not look into
+it), a path may be listed once and not as both a file and a directory, and a pod's answer is at most
 `POD_OUTPUT_MAX_BYTES` (512 MiB unless the config says otherwise).
+
+In the list you are asked about, a path with a name that starts with a dot (`.envrc`,
+`.vscode/tasks.json`, `.github/workflows/…`) is shown in red: tools read those without being
+asked, and may run what is in them.
 
 ### Run records
 A script `deploy` (a list of shell lines) streams its output live while
