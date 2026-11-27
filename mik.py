@@ -1524,6 +1524,9 @@ POD_TEXT_RANGES = (
     (0x2460, 0x27BF),  # enclosed numbers, box drawing, blocks, shapes, symbols, dingbats
 )
 
+# How many of the characters refused in one file are said, each with its line: enough to add them in one go.
+POD_TEXT_REFUSED_SAID = 20
+
 # git calls a file binary when there is a NUL in its first 8000 bytes (buffer_is_binary), and only there: a NUL
 # further down leaves it a text, shown by `git diff` like any other.
 GIT_BINARY_FIRST_BYTES = 8000
@@ -1577,11 +1580,14 @@ def _refuse_text_git_would_not_show_as_it_is(contents):
         except UnicodeDecodeError as exc:
             refused.append(f"{path}, line {content.count(b'\n', 0, exc.start) + 1}: not UTF-8")
             continue
-        found = not_allowed.search(text)
-        if found:
-            char = found[0]
+        # Each character that is refused is said once, where it is first found: what a file needs added to
+        # POD_TEXT_RANGES is then known from one refusal, not found out one fetch after the other.
+        first_found = sorted((text.index(char), char) for char in set(not_allowed.findall(text)))
+        for at, char in first_found[:POD_TEXT_REFUSED_SAID]:
             name = "a control character" if unicodedata.category(char) == "Cc" else unicodedata.name(char, "no name")
-            refused.append(f"{path}, line {text.count('\n', 0, found.start()) + 1}: U+{ord(char):04X} ({name})")
+            refused.append(f"{path}, line {text.count('\n', 0, at) + 1}: U+{ord(char):04X} ({name})")
+        if len(first_found) > POD_TEXT_REFUSED_SAID:
+            refused.append(f"{path}: and {len(first_found) - POD_TEXT_REFUSED_SAID} more")
     if refused:
         raise MikException(
             "Refusing what the pod sent: git would show these as text, and they hold what `git diff` would not "

@@ -15,7 +15,7 @@ KISS project and server management
 A tiny personal helper to deploy projects and pull dev changes back out of
 remote containers — driven by a single Python config file.
 
-## ⚠️ Warning
+## ⚠ Warning
 This is a proof-of-concept built around my own setup (docker, ssh). It works
 for me because I know exactly what it does — I don't recommend using it as-is.
 Read the source before pointing it at anything you care about. (Your config is
@@ -179,8 +179,8 @@ fine) and the characters of `POD_TEXT_RANGES` — an allowlist, and a short one:
 Latin Extended-A letters, dashes and curly quotes, arrows, box drawing and symbols. No control
 character, nothing that cannot be seen (no-break space, zero-width and direction marks, variation
 selectors), no other alphabet (the Cyrillic U+0430 passes for a Latin `a`), no emoji. One such
-character anywhere in a file, changed by the pod or not, and nothing is fetched: the file, the line
-and the code point are said. What your projects do write in, the config adds:
+character anywhere in a file, changed by the pod or not, and nothing is fetched: each one is said
+once, with the file and the line it is first found on. What your projects do write in, the config adds:
 
 ```python
 POD_TEXT_RANGES = (*POD_TEXT_RANGES, (0x1F300, 0x1FAFF), (0x0660, 0x0669))  # emoji, Arabic-Indic digits

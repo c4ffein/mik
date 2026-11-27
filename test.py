@@ -356,7 +356,7 @@ class ArtifactNameTests(unittest.TestCase):
         for suffix in self._BAD:
             with self.subTest(suffix=suffix), self.assertRaises(mik.MikException):
                 mik.build_artifact("site", suffix, built.append)
-        for release_id in ("²", "١٢٣", "12a", "-1", ""):
+        for release_id in ("²", "\u0661\u0662\u0663", "12a", "-1", ""):
             with self.subTest(release_id=release_id), self.assertRaises(mik.MikException):
                 mik.build_artifact("site", "dist", built.append, release_id=release_id)
         self.assertEqual(built, [])  # build() never ran
@@ -366,7 +366,15 @@ class ArtifactNameTests(unittest.TestCase):
     def test_an_entry_with_another_name_is_not_a_release(self):
         # isdigit() says yes to "²" and int() then refuses it: such a name is skipped, like any odd one.
         base = self.store / "site"
-        for entry in ("100-dist", "200-dist", "²-dist", "١٢٣-dist", "300-é", "400 dist", ".mik-build-500-dist"):
+        for entry in (
+            "100-dist",
+            "200-dist",
+            "²-dist",
+            "\u0661\u0662\u0663-dist",
+            "300-é",
+            "400 dist",
+            ".mik-build-500-dist",
+        ):
             (base / entry).mkdir(parents=True)
         self.assertEqual(mik.latest_release("site"), base / "200-dist")
         self.assertEqual(mik.resolve_release("site", "100"), base / "100-dist")
@@ -850,7 +858,7 @@ class DevFetchPodTests(unittest.TestCase):
             ):
                 with self.assertRaises(mik.MikException) as ctx:
                     mik.dev_fetch_pod(SimpleNamespace(instance="inst"))
-        self.assertEqual(str(ctx.exception), "SSH failed: boom [2J[H\nline 2\n�")
+        self.assertEqual(str(ctx.exception), "SSH failed: boom [2J[H\nline 2\n\ufffd")
 
     def test_remote_warnings_cannot_carry_escape_sequences(self):
         list_resp = json.dumps({"files": [], "errors": ["invalid path: a\033[2Kb"]}).encode()
@@ -956,7 +964,7 @@ class DevFetchPodTextTests(unittest.TestCase):
             *range(0x2028, 0x2030),  # line and paragraph separators, direction overrides
             *range(0x2060, 0x2070),  # word joiner, direction isolates
             0x0430,  # Cyrillic \u0430
-            0x03B1,  # Greek α
+            0x03B1,  # Greek alpha
             0xFE0F,  # variation selector
             0xFEFF,  # byte order mark
             0x1F600,  # emoji
@@ -1097,9 +1105,36 @@ class DevFetchPodTextTests(unittest.TestCase):
         )
         self.assertEqual(len(lines), 4)
 
+    def test_each_character_that_is_refused_is_said_once_where_it_is_first_found(self):
+        # What a file needs added to POD_TEXT_RANGES is known from one refusal, not one fetch after the other.
+        content = b"ok\n\x1b[8m\nfine\x7f \x1b[0m\n\b\x7f\n" + "caf".encode() + b"\n"
+        with self.assertRaises(mik.MikException) as ctx:
+            mik._refuse_text_git_would_not_show_as_it_is({"x.sh": content, "ok.txt": b"ok\n", "y": b"\x7f\n"})
+        self.assertEqual(
+            str(ctx.exception).split("\n")[1:-1],
+            [
+                "  x.sh, line 2: U+001B (a control character)",
+                "  x.sh, line 3: U+007F (a control character)",
+                "  x.sh, line 4: U+0008 (a control character)",
+                "  y, line 1: U+007F (a control character)",
+            ],
+        )
+        with mock.patch.object(mik, "POD_TEXT_REFUSED_SAID", 2):
+            with self.assertRaises(mik.MikException) as ctx:
+                mik._refuse_text_git_would_not_show_as_it_is({"x.sh": content, "y": b"\x7f\n"})
+        self.assertEqual(
+            str(ctx.exception).split("\n")[1:-1],
+            [
+                "  x.sh, line 2: U+001B (a control character)",
+                "  x.sh, line 3: U+007F (a control character)",
+                "  x.sh: and 1 more",
+                "  y, line 1: U+007F (a control character)",
+            ],
+        )
+
     def test_the_config_says_what_else_a_text_may_hold(self):
         check = mik._refuse_text_git_would_not_show_as_it_is
-        contents = {"x": "ok \U0001f600 ٣\n".encode()}
+        contents = {"x": "ok \U0001f600 \u0663\n".encode()}
         with self.assertRaises(mik.MikException):
             check(contents)
         with mock.patch.object(mik, "POD_TEXT_RANGES", (*mik.POD_TEXT_RANGES, (0x1F300, 0x1FAFF))):
