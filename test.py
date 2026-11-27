@@ -498,7 +498,7 @@ class ListingTests(unittest.TestCase):
 class DevFetchPodTests(unittest.TestCase):
     def setUp(self):
         # These local repos are plain directories: what git ignores is DevFetchPodIgnoredTests' to test.
-        for asked_of_git in ("_locally_ignored", "_locally_unwatched"):
+        for asked_of_git in ("_locally_ignored", "_locally_unwatched", "_locally_attributed"):
             patcher = mock.patch.object(mik, asked_of_git, return_value=[])
             patcher.start()
             self.addCleanup(patcher.stop)
@@ -865,6 +865,323 @@ class DevFetchPodTests(unittest.TestCase):
 
 
 @unittest.skipUnless(shutil.which("git"), "needs git")
+class DevFetchPodTextTests(unittest.TestCase):
+    """A text that comes from a pod holds nothing `git diff` would not show as it is; a binary file passes."""
+
+    ESC = b"\x1b"
+
+    def setUp(self):
+        # Plain directories: what git ignores or was told not to look at is DevFetchPodIgnoredTests' to test.
+        for asked_of_git in ("_locally_ignored", "_locally_unwatched", "_locally_attributed"):
+            patcher = mock.patch.object(mik, asked_of_git, return_value=[])
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        for registry in (mik.instances_dict, mik.machines_dict, mik.projects_dict):
+            registry.clear()
+            self.addCleanup(registry.clear)
+
+    def _fetch(self, local_repo, files):
+        """Run dev-fetch-pod, answered y, against a pod that sends {path: content}: what was printed, as lines."""
+        mik.machines_dict["box"] = SimpleNamespace(name="box", ssh_host="user@host")
+        mik.projects_dict["proj"] = SimpleNamespace(name="proj", local_repo=str(local_repo), github_repo=None)
+        mik.instances_dict["inst"] = _inst("inst", project="proj", machine="box", container="c1", code_dir="/code")
+        listed = [{"path": path, "status": "M"} for path in files]
+        payload = {"files": {p: mik.base64.b64encode(c).decode() for p, c in files.items()}, "deleted": []}
+        responses = [
+            (0, b"", json.dumps({"files": listed, "errors": []}).encode()),
+            (0, b"", mik.base64.b64encode(json.dumps(payload).encode())),
+        ]
+        with (
+            mock.patch.object(mik, "_run_remote_script", side_effect=responses),
+            mock.patch("builtins.input", return_value="y"),
+            mock.patch("builtins.print") as printed,
+        ):
+            mik.dev_fetch_pod(SimpleNamespace(instance="inst"))
+        return [str(c.args[0]) for c in printed.call_args_list if c.args]
+
+    def test_binary_is_what_git_calls_binary(self):
+        first = mik.GIT_BINARY_FIRST_BYTES
+        self.assertEqual(first, 8000)
+        for content, binary in (
+            (b"", False),
+            (b"plain\n", False),
+            (b"\0", True),
+            (b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR", True),
+            (b"a" * (first - 1) + b"\0", True),  # the last byte git looks at
+            (b"a" * first + b"\0", False),  # the first one it does not: a text, to git
+        ):
+            with self.subTest(content=content[:20], size=len(content)):
+                self.assertEqual(mik._is_binary_to_git(content), binary)
+
+    def test_git_itself_says_the_same_of_a_late_nul(self):
+        # Not mik's word against git's: a NUL after the first 8000 bytes, and `git diff` shows the file as text.
+        if not shutil.which("git"):
+            self.skipTest("no git")
+        with tempfile.TemporaryDirectory() as d:
+            git = [
+                "git",
+                "-C",
+                d,
+                "-c",
+                "user.email=t@example.invalid",
+                "-c",
+                "user.name=t",
+                "-c",
+                "commit.gpgsign=false",
+            ]
+            subprocess.run([*git, "init", "-q"], check=True, capture_output=True)
+            for name in ("late", "early"):
+                (Path(d) / name).write_bytes(b"x\n")
+            subprocess.run([*git, "add", "."], check=True, capture_output=True)
+            subprocess.run([*git, "commit", "-q", "-m", "init"], check=True, capture_output=True)
+            for name, content in (("late", b"y\n" + b"# pad\n" * 1500 + b"\0\n"), ("early", b"y\n\0\n")):
+                (Path(d) / name).write_bytes(content)
+                shown = subprocess.run([*git, "diff", "--numstat", name], check=True, capture_output=True).stdout
+                self.assertEqual(shown.startswith(b"-\t-\t"), mik._is_binary_to_git(content), name)  # "-" is binary
+
+    def test_the_default_ranges_hold_nothing_but_what_is_seen(self):
+        seen = 0
+        for first, last in mik.POD_TEXT_RANGES:
+            for code_point in range(first, last + 1):
+                category = mik.unicodedata.category(chr(code_point))
+                self.assertTrue(category[0] in "LNPS" or code_point == 0x20, f"U+{code_point:04X} is {category}")
+                seen += 1
+        self.assertGreater(seen, 1000)
+        allowed = {cp for first, last in mik.POD_TEXT_RANGES for cp in range(first, last + 1)}
+        for code_point in (
+            *range(0x00, 0x20),  # the tab and the newline are not a matter of ranges
+            *range(0x7F, 0xA1),  # DEL, the C1 controls, the no-break space
+            0xAD,  # soft hyphen
+            *range(0x2000, 0x2010),  # spaces of every width, zero-width ones, direction marks
+            *range(0x2028, 0x2030),  # line and paragraph separators, direction overrides
+            *range(0x2060, 0x2070),  # word joiner, direction isolates
+            0x0430,  # Cyrillic \u0430
+            0x03B1,  # Greek α
+            0xFE0F,  # variation selector
+            0xFEFF,  # byte order mark
+            0x1F600,  # emoji
+        ):
+            self.assertNotIn(code_point, allowed, f"U+{code_point:04X}")
+
+    def test_a_plain_text_and_a_binary_file_are_accepted(self):
+        check = mik._refuse_text_git_would_not_show_as_it_is
+        check({})
+        check(
+            {
+                "empty": b"",
+                "ascii.py": b"def f(x):\n\treturn x  # ~!@#$%^&*()\n",
+                "windows.txt": b"one\r\ntwo\r\n",
+                "french.md": "déjà vu — « œuvre »… → ✓ ✗ ⚠ ─│┌ ≤ ×\n".encode(),
+                "image.png": b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR\x1b[8m\x08\x7f\xff",  # binary: not looked into
+            }
+        )
+
+    def test_a_text_with_anything_else_is_refused_and_the_line_said(self):
+        for name, content, said in (
+            ("a carriage return at the very end", b"a\nb\r", "x, line 2: U+000D"),
+            ("a NUL git does not look at", b"a\n" * 4000 + b"\0\n", "x, line 4001: U+0000 (a control character)"),
+            ("DEL", b"a\x7fb\n", "x, line 1: U+007F"),
+            ("form feed", b"a\n\x0cb\n", "x, line 2: U+000C"),
+            ("a C1 control", "a\u009b8m\n".encode(), "x, line 1: U+009B (a control character)"),
+            ("no-break space", "a\n\nb\u00a0c\n".encode(), "x, line 3: U+00A0 (NO-BREAK SPACE)"),
+            ("soft hyphen", "a\u00adb\n".encode(), "x, line 1: U+00AD (SOFT HYPHEN)"),
+            ("zero width space", "a\u200bb\n".encode(), "x, line 1: U+200B (ZERO WIDTH SPACE)"),
+            ("direction override", "a\n/* \u202e } */\n".encode(), "x, line 2: U+202E (RIGHT-TO-LEFT OVERRIDE)"),
+            ("direction isolate", "a\u2066b\n".encode(), "x, line 1: U+2066 (LEFT-TO-RIGHT ISOLATE)"),
+            ("line separator", "a\u2028b\n".encode(), "x, line 1: U+2028 (LINE SEPARATOR)"),
+            ("byte order mark", "\ufeffa\n".encode(), "x, line 1: U+FEFF"),
+            (
+                "a letter that looks like ours",
+                "p\u0430ss = 1\n".encode(),
+                "x, line 1: U+0430 (CYRILLIC SMALL LETTER A)",
+            ),
+            ("emoji", "ok\n\U0001f600\n".encode(), "x, line 2: U+1F600 (GRINNING FACE)"),
+            ("variation selector", "a\n⚠\ufe0f\n".encode(), "x, line 2: U+FE0F (VARIATION SELECTOR-16)"),
+            ("combining mark", "e\u0301\n".encode(), "x, line 1: U+0301 (COMBINING ACUTE ACCENT)"),
+            ("Latin-1, not UTF-8", b"a\nb\ncaf\xe9\n", "x, line 3: not UTF-8"),
+            ("half a UTF-8 character", b"a\xe2\x82", "x, line 1: not UTF-8"),
+        ):
+            with self.subTest(name=name):
+                with self.assertRaises(mik.MikException) as ctx:
+                    mik._refuse_text_git_would_not_show_as_it_is({"fine.txt": b"fine\n", "x": content})
+                message = str(ctx.exception)
+                self.assertIn(said, message)
+                self.assertNotIn("fine.txt", message)
+                self.assertIn("Nothing was written. (POD_TEXT_RANGES, in the config", message)
+                self.assertTrue(message.isascii() and "\x1b" not in message and "\b" not in message)
+
+    def _scripts(self):
+        """Whole scripts, as a pod would send them in place of a `run.sh` that ends with `echo done`.
+
+        {what is done to the line: (content, the character mik names — None for the one git calls binary)}.
+        Each one still runs, and runs PAYLOAD; and each one has that line on line 3, written so that a
+        terminal does not show it as it is. What is after a `#` is a comment to sh: that is where the
+        characters that write over the line go, with what is to be read in its place.
+        """
+        esc, payload, head = self.ESC, self.PAYLOAD, b"#!/bin/sh\necho building\n"
+        cover = b"echo done".ljust(len(payload) + 2)  # as wide as what it is written over
+        concealed = head + b"echo 'done" + esc + b"[8m' ; " + payload + b"\n"
+        return {
+            "the end of the line is concealed": (concealed, "U+001B"),
+            "the end of the line is black on black": (
+                head + b"echo 'done" + esc + b"[30;40m' ; " + payload + b"\n",
+                "U+001B",
+            ),
+            "backspaces, and the line is written over": (
+                head + payload + b" #" + b"\b" * len(cover) + cover + b"\n",
+                "U+0008",
+            ),
+            "a carriage return, and the line is written over": (head + payload + b" #\r" + cover + b"\n", "U+000D"),
+            "the line is erased, and written again": (
+                head + payload + b" #" + esc + b"[2K\r" + cover + b"\n",
+                "U+001B",
+            ),
+            "a NUL too far down for git to call it binary": (concealed + b"# pad\n" * 1500 + b"# \0\n", "U+001B"),
+            "a NUL, and git calls it binary": (head + b"# \0\n" + payload + b"\n", None),
+        }
+
+    PAYLOAD = b"echo you-did-not-see-that"
+
+    def test_scripts_that_run_a_line_git_diff_does_not_show_as_it_is(self):
+        # Why the check is there, shown on the real things: sh runs the line, git sends it to the terminal as it
+        # is (or says nothing of it), and mik refuses it. What a pager and a terminal then make of it is theirs.
+        if not (shutil.which("git") and shutil.which("sh")):
+            self.skipTest("needs git and sh")
+        with tempfile.TemporaryDirectory() as d:
+            git = [
+                "git",
+                "-C",
+                d,
+                "-c",
+                "user.email=t@example.invalid",
+                "-c",
+                "user.name=t",
+                "-c",
+                "commit.gpgsign=false",
+            ]
+            script = Path(d) / "run.sh"
+            script.write_bytes(b"#!/bin/sh\necho building\necho done\n")
+            subprocess.run([*git, "init", "-q"], check=True, capture_output=True)
+            subprocess.run([*git, "add", "run.sh"], check=True, capture_output=True)
+            subprocess.run([*git, "commit", "-q", "-m", "init"], check=True, capture_output=True)
+            for name, (content, named) in self._scripts().items():
+                with self.subTest(name=name):
+                    script.write_bytes(content)
+                    ran = subprocess.run(["sh", str(script)], capture_output=True)
+                    self.assertEqual((ran.returncode, ran.stderr), (0, b""))
+                    self.assertIn(b"\nyou-did-not-see-that\n", ran.stdout)  # it runs
+                    shown = subprocess.run([*git, "diff"], check=True, capture_output=True).stdout
+                    if named is None:
+                        self.assertIn(b"Binary files a/run.sh and b/run.sh differ", shown)
+                        self.assertNotIn(self.PAYLOAD, shown)  # git says nothing of what is in it
+                        self.assertTrue(mik._is_binary_to_git(content))
+                        mik._refuse_text_git_would_not_show_as_it_is({"run.sh": content})  # accepted: it is said
+                    else:
+                        control = chr(int(named[2:], 16)).encode()
+                        self.assertIn(b"+" + content.split(b"\n")[2] + b"\n", shown)  # the line, as it is
+                        self.assertIn(control, shown)
+                        self.assertNotIn(b"Binary files", shown)
+                        with self.assertRaises(mik.MikException) as ctx:
+                            mik._refuse_text_git_would_not_show_as_it_is({"run.sh": content})
+                        self.assertIn(f"run.sh, line 3: {named} (a control character)", str(ctx.exception))
+
+    def test_every_file_that_is_refused_is_said_once(self):
+        with self.assertRaises(mik.MikException) as ctx:
+            mik._refuse_text_git_would_not_show_as_it_is(
+                {"a.sh": b"\x1b[8m\n\x1b[8m\n", "ok.txt": b"ok\n", "sub/b.py": b"x\n\by\n", "c.png": b"\0\x1b"}
+            )
+        lines = str(ctx.exception).split("\n")
+        self.assertEqual(
+            lines[1:3],
+            ["  a.sh, line 1: U+001B (a control character)", "  sub/b.py, line 2: U+0008 (a control character)"],
+        )
+        self.assertEqual(len(lines), 4)
+
+    def test_the_config_says_what_else_a_text_may_hold(self):
+        check = mik._refuse_text_git_would_not_show_as_it_is
+        contents = {"x": "ok \U0001f600 ٣\n".encode()}
+        with self.assertRaises(mik.MikException):
+            check(contents)
+        with mock.patch.object(mik, "POD_TEXT_RANGES", (*mik.POD_TEXT_RANGES, (0x1F300, 0x1FAFF))):
+            with self.assertRaises(mik.MikException) as ctx:
+                check(contents)
+            self.assertIn("U+0663 (ARABIC-INDIC DIGIT THREE)", str(ctx.exception))
+        with mock.patch.object(mik, "POD_TEXT_RANGES", [*mik.POD_TEXT_RANGES, (0x1F300, 0x1FAFF), [0x660, 0x669]]):
+            check(contents)
+        with mock.patch.object(mik, "POD_TEXT_RANGES", ()):  # nothing but tabs and newlines
+            check({"x": b"\t\n\r\n"})
+            with self.assertRaises(mik.MikException):
+                check({"x": b"a\n"})
+        with mock.patch.object(
+            mik, "POD_TEXT_RANGES", ((ord("-"), ord("]")), (ord("^"), ord("^")), (ord("\\"), ord("\\")))
+        ):
+            check({"x": b"-]^\\AZ\n"})  # each one a character, not a sign of the pattern that is made of them
+            with self.assertRaises(mik.MikException):
+                check({"x": b"a\n"})
+        self.assertIn("POD_TEXT_RANGES", mik.CONFIG_SETTINGS)
+
+    def test_ranges_that_are_not_ranges_are_refused(self):
+        for ranges in (
+            None,
+            5,
+            "az",
+            [(0x20,)],
+            [(0x20, 0x7E, 0x80)],
+            [("a", "z")],
+            [(0x7E, 0x20)],  # last before first
+            [(-1, 5)],
+            [(0x20, 0x110000)],  # past the last code point there is
+            [(True, 0x7E)],
+            [(32.0, 0x7E)],
+            [(0x20, 0x7E), None],
+        ):
+            with self.subTest(ranges=ranges), mock.patch.object(mik, "POD_TEXT_RANGES", ranges):
+                with self.assertRaises(mik.MikException) as ctx:
+                    mik._refuse_text_git_would_not_show_as_it_is({"x": b"a\n"})
+                self.assertIn("POD_TEXT_RANGES, in the config, has to be", str(ctx.exception))
+
+    def test_nothing_is_written_when_a_text_is_refused(self):
+        with tempfile.TemporaryDirectory() as d:
+            (Path(d) / "run.sh").write_bytes(b"echo ok\n")
+            (Path(d) / "a.txt").write_bytes(b"mine\n")
+            before = sorted(str(x) for x in Path(d).rglob("*"))
+            with self.assertRaises(mik.MikException) as ctx:
+                self._fetch(d, {"a.txt": b"theirs\n", "run.sh": b"echo ok" + self.ESC + b"[8m ; echo hidden\n"})
+            self.assertIn("run.sh, line 1: U+001B", str(ctx.exception))
+            self.assertEqual((Path(d) / "a.txt").read_bytes(), b"mine\n")
+            self.assertEqual((Path(d) / "run.sh").read_bytes(), b"echo ok\n")
+            self.assertEqual(sorted(str(x) for x in Path(d).rglob("*")), before)
+
+    def test_a_text_that_comes_as_a_binary_file_is_written_and_said(self):
+        png = b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR"
+        with tempfile.TemporaryDirectory() as d:
+            (Path(d) / "kek.png").write_bytes(b"not the image yet\n")
+            (Path(d) / "run.sh").write_bytes(b"echo ok\n")
+            (Path(d) / "old.png").write_bytes(png)
+            (Path(d) / "a.txt").write_bytes(b"mine\n")
+            contents = {
+                "kek.png": png,  # was a text here
+                "run.sh": b"echo ok\n# \0\necho more\n",  # was a text here
+                "old.png": png + b"more",  # was binary already
+                "new.png": png,  # was not here
+                "a.txt": b"theirs\n",  # is a text still
+            }
+            printed = self._fetch(d, contents)
+            for path, content in contents.items():
+                self.assertEqual((Path(d) / path).read_bytes(), content)
+        said = [line for line in printed if "came as a binary file" in line]
+        self.assertEqual(len(said), 2)
+        self.assertIn("\033[31mwas a text here, came as a binary file\033[39m: kek.png (`git diff` will not", said[0])
+        self.assertIn(": run.sh (", said[1])
+        self.assertLess(printed.index("\nDone: 5 written, 0 deleted."), printed.index(said[0]))  # the last word
+
+    def test_no_word_about_binary_files_when_no_text_became_one(self):
+        with tempfile.TemporaryDirectory() as d:
+            (Path(d) / "a.txt").write_bytes(b"mine\n")
+            printed = self._fetch(d, {"a.txt": b"theirs\n", "new.bin": b"\0\1\2"})
+        self.assertFalse(any("binary" in line for line in printed))
+
+
 class DevFetchPodIgnoredTests(unittest.TestCase):
     """What the local repo ignores, `git status` there does not show: a pod does not get to write or delete it."""
 
@@ -1030,6 +1347,93 @@ class DevFetchPodIgnoredTests(unittest.TestCase):
                     self.assertEqual((self.calls, self.asked), (1, 0))  # no question, no fetch
                     self.assertEqual((repo / "local.cfg").read_text(), "my own change, kept out of sight\n")
                     self.assertEqual((repo / "app.py").read_text(), "a\n")
+
+    def test_what_git_has_attributes_for_is_asked_of_git(self):
+        with tempfile.TemporaryDirectory() as d:
+            repo = self._repo(d)
+            ask = mik._locally_attributed
+            paths = ["app.py", "a.ps1", "new.py", "sub/x.bin", "sub/deep/y.txt", "sub/a.ps1"]
+            self.assertEqual(ask(str(repo), paths), [])  # no attributes anywhere: nothing is said
+            self.assertEqual(ask(str(repo), []), [])
+            (repo / ".gitattributes").write_text("*.ps1 working-tree-encoding=UTF-16LE\n*.bin binary\n")
+            (repo / "sub" / "deep").mkdir(parents=True)
+            (repo / "sub" / ".gitattributes").write_text("*.txt text eol=crlf\n")  # one further down, not tracked
+            self.assertEqual(
+                ask(str(repo), paths),
+                [
+                    ("a.ps1", ["working-tree-encoding"]),
+                    ("sub/x.bin", ["binary", "diff", "merge", "text"]),
+                    ("sub/deep/y.txt", ["text", "eol"]),
+                    ("sub/a.ps1", ["working-tree-encoding"]),
+                ],
+            )
+            self.assertEqual(ask(str(repo), ["app.py", "new.py", "sub/other.py"]), [])
+            # a local_repo that is a directory of a repository: the paths are from local_repo
+            self.assertEqual(ask(str(repo / "sub"), ["a.ps1", "app.py"]), [("a.ps1", ["working-tree-encoding"])])
+            # .git/info/attributes is one more place they come from
+            (repo / ".gitattributes").unlink()
+            (repo / ".git" / "info").mkdir(exist_ok=True)
+            (repo / ".git" / "info" / "attributes").write_text("app.py -diff\n")
+            self.assertEqual(ask(str(repo), ["app.py", "a.ps1", "new.py"]), [("app.py", ["diff"])])
+
+    def test_a_path_git_has_attributes_for_is_refused_before_the_question(self):
+        for path, status in (("a.ps1", "A"), ("app.py", "M"), ("app.py", "D")):
+            with self.subTest(path=path, status=status), tempfile.TemporaryDirectory() as d:
+                repo = self._repo(d)
+                (repo / ".gitattributes").write_text("*.ps1 working-tree-encoding=UTF-16LE\napp.py text=auto eol=lf\n")
+                before = sorted(str(x) for x in repo.rglob("*") if ".git" not in x.parts)
+                with self.assertRaises(mik.MikException) as ctx:
+                    self._fetch([("new.py", "A", b"n\n"), (path, status, b"from the pod\n")], answer=False)
+                names = "working-tree-encoding" if path == "a.ps1" else "text, eol"
+                self.assertIn(f"git has attributes for {path} ({names}) in the local repo", str(ctx.exception))
+                self.assertIn("Nothing was fetched.", str(ctx.exception))
+                self.assertEqual((self.calls, self.asked), (1, 0))  # no question, no fetch
+                self.assertEqual(sorted(str(x) for x in repo.rglob("*") if ".git" not in x.parts), before)
+                self.assertEqual((repo / "app.py").read_text(), "a\n")
+
+    def test_a_repo_with_attributes_for_other_paths_is_fetched_into(self):
+        with tempfile.TemporaryDirectory() as d:
+            repo = self._repo(d)
+            (repo / ".gitattributes").write_text("*.ps1 working-tree-encoding=UTF-16LE\n")
+            self._fetch([("app.py", "M", b"b\n"), ("new.py", "A", b"n\n")])
+            self.assertEqual((repo / "app.py").read_text(), "b\n")
+            self.assertEqual((repo / "new.py").read_text(), "n\n")
+
+    def test_why_attributes_are_refused_git_shows_as_text_what_mik_calls_binary(self):
+        # working-tree-encoding: on disk the file is UTF-16, a NUL every other byte, so it is binary to the check
+        # of what a pod sent and would not be looked into. git converts it, and `git diff` sends it all.
+        with tempfile.TemporaryDirectory() as d:
+            repo = self._repo(d)
+            (repo / ".gitattributes").write_text("*.ps1 working-tree-encoding=UTF-16LE\n")
+            (repo / "a.ps1").write_bytes("echo ok\n".encode("utf-16-le"))
+            self._git(repo, "add", ".gitattributes", "a.ps1")
+            self._git(repo, "commit", "-q", "-m", "ps1")
+            sent = "echo ok\necho done\x1b[8m ; echo you-did-not-see-that\n".encode("utf-16-le")
+            self.assertTrue(mik._is_binary_to_git(sent))
+            mik._refuse_text_git_would_not_show_as_it_is({"a.ps1": sent})  # accepted there: not looked into
+            (repo / "a.ps1").write_bytes(sent)
+            shown = subprocess.run(["git", "-C", str(repo), "diff"], check=True, capture_output=True).stdout
+            self.assertNotIn(b"Binary files", shown)
+            self.assertIn(b"+echo done\x1b[8m ; echo you-did-not-see-that\n", shown)
+            self.assertEqual(mik._locally_attributed(str(repo), ["a.ps1"]), [("a.ps1", ["working-tree-encoding"])])
+
+    def test_a_local_repo_git_cannot_be_asked_what_attributes_it_has_gets_nothing(self):
+        with tempfile.TemporaryDirectory() as d:
+            plain = Path(d) / "plain"
+            plain.mkdir()
+            with mock.patch.dict(os.environ, {"GIT_CEILING_DIRECTORIES": d}):
+                with self.assertRaises(mik.MikException) as ctx:
+                    mik._locally_attributed(str(plain), ["a.txt"])
+            self.assertIn("is it a git repository?", str(ctx.exception))
+        with mock.patch.object(mik.subprocess, "run", side_effect=FileNotFoundError("git")):
+            with self.assertRaises(mik.MikException):
+                mik._locally_attributed("/nowhere", ["a.txt"])
+        for stdout in (b"a.txt\0diff\0", b"a.txt\0diff\0unset", b"junk"):  # not three fields for each
+            with self.subTest(stdout=stdout):
+                answered = SimpleNamespace(returncode=0, stdout=stdout, stderr=b"")
+                with mock.patch.object(mik.subprocess, "run", return_value=answered):
+                    with self.assertRaises(mik.MikException):
+                        mik._locally_attributed("/nowhere", ["a.txt"])
 
     def test_a_local_repo_git_cannot_be_asked_what_it_tracks_gets_nothing(self):
         with tempfile.TemporaryDirectory() as d:

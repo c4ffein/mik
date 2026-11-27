@@ -14,6 +14,7 @@ import base64
 import os
 import re
 import traceback
+import unicodedata
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from enum import Enum
@@ -1416,6 +1417,48 @@ def _locally_unwatched(local_repo, paths):
     return [path for path in paths if path in unwatched]
 
 
+def _locally_attributed(local_repo, paths):
+    """Those of `paths` git has attributes for in the local repo, as [(path, [attribute names])], in their order.
+
+    An attribute changes what `git diff` shows of a file, and what mik checks of a file a pod sent
+    (_refuse_text_git_would_not_show_as_it_is) is made for git's plain rule only: a NUL in the first bytes
+    and git shows nothing, else it shows the bytes. With `working-tree-encoding=UTF-16LE` a file that is
+    full of NULs here — binary, to that check, and not looked into — is converted, and shown as a text with
+    all that is in it. `diff` shows a binary file as text, a `filter` or a diff driver shows what a
+    program made of it, `text` and `eol` leave a change of line ends out. Which attribute does what, and for
+    which value, is not sorted out here: a path that has any is refused, and what is then needed is done by
+    hand, or sorted out the day it is needed.
+
+    Asked of git (`git check-attr -a`), which knows every place they come from: the .gitattributes of each
+    directory, .git/info/attributes, your own attributes file and the system's. The paths go through stdin,
+    NUL-ended: none is an argument. A pod cannot send a .gitattributes (validate_path refuses the name), so
+    this is asked once, before the question. As for _locally_ignored: if git cannot be asked, nothing is
+    fetched.
+    """
+    if not paths:
+        return []
+    try:
+        asked = subprocess.run(
+            ["git", "-C", str(local_repo), "check-attr", "--stdin", "-z", "-a"],
+            capture_output=True,
+            input=b"".join(os.fsencode(path) + b"\0" for path in paths),
+        )
+    except OSError as exc:
+        raise MikException(
+            f"could not run git to ask what attributes {local_repo} has: {exc}. Nothing was fetched."
+        ) from exc
+    answer = asked.stdout.split(b"\0")  # path, attribute, value, and again: three fields for each one that is set
+    if asked.returncode != 0 or len(answer) % 3 != 1 or answer[-1]:
+        raise MikException(
+            f"could not ask git what attributes {local_repo} has (rc={asked.returncode}), is it a git repository? "
+            f"Nothing was fetched.\n{_printable_lines(asked.stderr)}"
+        )
+    found = {}
+    for i in range(0, len(answer) - 1, 3):
+        found.setdefault(os.fsdecode(answer[i]), []).append(_printable(os.fsdecode(answer[i + 1])))
+    return [(path, found[path]) for path in paths if path in found]
+
+
 def _checked_remote_contents(payload, files):
     """What a pod sent for the confirmed `files`, as ({path: bytes}, [deleted paths]) — or refused as a whole.
 
@@ -1458,6 +1501,104 @@ def _checked_remote_contents(payload, files):
             print(f"{Color.RED.value}  {_printable(p)}{Color.WHITE.value}")
         raise MikException(f"{len(problems)} mismatch(es) with confirmed list, aborting")
     return decoded, deleted
+
+
+# What a text file that comes from a pod may hold, as (first, last) code points, both included — beside the
+# tab, the newline, and a carriage return that is right before a newline. An allowlist, and a short one: what
+# is not in it is refused, and a config adds what its projects write in (the config may set another:
+# POD_TEXT_RANGES = (*POD_TEXT_RANGES, (0x1F300, 0x1FAFF)) for emoji, say). Left out on purpose:
+#   - every control character (ESC, backspace, a lone carriage return, DEL, the C1 ones): a terminal obeys
+#     them, and `git diff` sends a file as it is — see _refuse_text_git_would_not_show_as_it_is;
+#   - what cannot be seen, or changes the order of what is: the no-break and other spaces (U+00A0, U+2000…),
+#     the soft hyphen (U+00AD), zero-width and direction marks (U+200B…U+200F, U+202A…U+202E, U+2066…U+2069),
+#     variation selectors, the byte order mark, combining marks;
+#   - every other alphabet: the Cyrillic letter U+0430 in a name is not the Latin "a" it looks like.
+POD_TEXT_RANGES = (
+    (0x20, 0x7E),  # ASCII, what is printed of it
+    (0xA1, 0xAC),  # Latin-1 (é ç « » × °), from after the no-break space...
+    (0xAE, 0xFF),  # ...and without the soft hyphen
+    (0x100, 0x17F),  # Latin Extended-A (œ Œ)
+    (0x2010, 0x2027),  # hyphens and dashes, curly quotes, daggers, bullets, the ellipsis
+    (0x2190, 0x2426),  # arrows, mathematical operators, technical signs, pictures of the controls
+    (0x2440, 0x244A),  # OCR
+    (0x2460, 0x27BF),  # enclosed numbers, box drawing, blocks, shapes, symbols, dingbats
+)
+
+# git calls a file binary when there is a NUL in its first 8000 bytes (buffer_is_binary), and only there: a NUL
+# further down leaves it a text, shown by `git diff` like any other.
+GIT_BINARY_FIRST_BYTES = 8000
+
+
+def _is_binary_to_git(content):
+    """True if git would call `content` binary — `git diff` then says that it differs, and shows none of it."""
+    return b"\0" in content[:GIT_BINARY_FIRST_BYTES]
+
+
+def _refuse_text_git_would_not_show_as_it_is(contents):
+    """Refuse what a pod sent, as a whole, if a text file in it holds a character out of POD_TEXT_RANGES.
+
+    What comes from a pod is reviewed with `git diff`, and `git diff` writes a file to the terminal as it is: a
+    terminal does not show a control character, it obeys it. A line can hide its own end (`ESC[8m`, or black
+    on black), write over itself (backspaces, a carriage return), or be shown in another order (a direction
+    mark), and the pager git uses lets some of that through. The line that is run is then not the line that
+    was read. Nothing of that is to be looked for at review time: it is refused here, before the first write.
+
+    Only what git shows is checked, so the test for "binary" is git's own (_is_binary_to_git): of a binary
+    file `git diff` shows nothing, there is nothing to hide in it, and an image is accepted as it comes. A
+    text has to be UTF-8, with nothing but the tab, the newline, a carriage return right before a newline
+    (line ends from Windows), and what POD_TEXT_RANGES lists. The whole file is looked at, not what changed
+    in it: one that already holds such a character here is refused too, and is to be copied by hand.
+
+    All of this is said of a terminal that reads UTF-8, and mik expects yours to: git sends bytes, and it is
+    the terminal that makes characters of them. One that is set to an 8-bit charset reads others in the same
+    bytes: U+00DB is in the ranges, it is C3 9B in UTF-8, and 9B alone is a control there (CSI, as ESC [ is).
+    Only ASCII says the same to every terminal; POD_TEXT_RANGES can be cut down to it.
+    """
+    ranges = POD_TEXT_RANGES
+    well_made = isinstance(ranges, (list, tuple)) and all(
+        isinstance(r, (list, tuple))
+        and len(r) == 2
+        and all(type(code_point) is int for code_point in r)
+        and 0 <= r[0] <= r[1] <= sys.maxunicode
+        for r in ranges
+    )
+    if not well_made:
+        raise MikException(
+            "POD_TEXT_RANGES, in the config, has to be (first, last) pairs of code points. Nothing was written."
+        )
+    listed = "".join(f"{re.escape(chr(first))}-{re.escape(chr(last))}" for first, last in ranges)
+    not_allowed = re.compile(f"[^\t\n{listed}]")
+    refused = []
+    for path, content in contents.items():
+        if _is_binary_to_git(content):
+            continue
+        try:
+            text = content.decode("utf-8").replace("\r\n", "\n")
+        except UnicodeDecodeError as exc:
+            refused.append(f"{path}, line {content.count(b'\n', 0, exc.start) + 1}: not UTF-8")
+            continue
+        found = not_allowed.search(text)
+        if found:
+            char = found[0]
+            name = "a control character" if unicodedata.category(char) == "Cc" else unicodedata.name(char, "no name")
+            refused.append(f"{path}, line {text.count('\n', 0, found.start()) + 1}: U+{ord(char):04X} ({name})")
+    if refused:
+        raise MikException(
+            "Refusing what the pod sent: git would show these as text, and they hold what `git diff` would not "
+            "show as it is (a control character is obeyed by the terminal, a letter of another alphabet "
+            "passes for one of ours):\n  "
+            + "\n  ".join(refused)
+            + "\nNothing was written. (POD_TEXT_RANGES, in the config, if such a character is expected.)"
+        )
+
+
+def _is_text_here(dest):
+    """True if `dest` is a file of the local repo that git shows as text (one that cannot be read is not said to be)."""
+    try:
+        with open(dest, "rb") as there:
+            return not _is_binary_to_git(there.read(GIT_BINARY_FIRST_BYTES))
+    except OSError:  # not there yet, or not ours to read: nothing to compare with
+        return False
 
 
 def _printable_lines(raw):
@@ -1567,6 +1708,15 @@ def dev_fetch_pod(args):
             f"repo (git update-index --skip-worktree or --assume-unchanged). `git status` and `git diff` would "
             f"not show what was done to them, and what you keep there would be replaced. Nothing was fetched."
         )
+    attributed = _locally_attributed(local_repo, [f["path"] for f in files])
+    if attributed:
+        raise MikException(
+            f"Refusing the remote file list: git has attributes for "
+            f"{', '.join(f'{path} ({", ".join(names)})' for path, names in attributed)} in the local repo (from a "
+            f".gitattributes, .git/info/attributes or your own attributes file). An attribute changes what "
+            f"`git diff` shows of a file, and mik only knows how to check what git shows without one. Nothing "
+            f"was fetched."
+        )
     # Display
     for f in files:
         color = Color.RED.value if f["status"] == "D" else Color.GREEN.value
@@ -1596,6 +1746,8 @@ def dev_fetch_pod(args):
         raise MikException("Bad fetch response")
     # Preemptive check — reject entire response if it is not exactly the confirmed list, contents decoded
     contents, deleted_paths = _checked_remote_contents(payload, files)
+    # And nothing in a text that `git diff` would not show as it is (a binary file is shown as such, and passes)
+    _refuse_text_git_would_not_show_as_it_is(contents)
     # Asked again before the first write, now that the contents are here: the .gitignore files that came are
     # part of the rules, and one of them may hide a file that came with it. Judged as the repo would be.
     hidden = _locally_ignored(local_repo, [f["path"] for f in files], {**contents, **dict.fromkeys(deleted_paths)})
@@ -1604,6 +1756,10 @@ def dev_fetch_pod(args):
             f"Refusing what the pod sent: with the .gitignore that comes with it, the local repo would ignore "
             f"{', '.join(hidden)}, and `git status` would not show them. Nothing was written."
         )
+    # A file that is a text here and comes as a binary one is written like any other (a file that got its real
+    # content at last, an image), but said: from then on `git diff` shows nothing of what is in it. Looked at
+    # now, while what is here is still here.
+    became_binary = [p for p, content in contents.items() if _is_binary_to_git(content) and _is_text_here(dests[p])]
     # Apply
     written = 0
     deleted = 0
@@ -1641,6 +1797,11 @@ def dev_fetch_pod(args):
         else:
             print(f"{Color.DIM.value}  already absent: {fpath}{Color.WHITE.value}")
     print(f"\nDone: {written} written, {deleted} deleted.")
+    for fpath in became_binary:
+        print(
+            f"  {Color.RED.value}was a text here, came as a binary file{Color.WHITE.value}: {fpath} "
+            f"(`git diff` will not show what is in it)"
+        )
 
 
 GITHUB_API = "https://api.github.com"
@@ -1919,6 +2080,7 @@ CONFIG_SETTINGS = frozenset(
         "ARTIFACTS_DIR",
         "RUNS_DIR",
         "POD_OUTPUT_MAX_BYTES",
+        "POD_TEXT_RANGES",
     }
 )
 

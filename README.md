@@ -66,7 +66,7 @@ Because the config runs in mik's namespace, a name of mik's own that it defines 
 helper called `build`, say) would replace mik's: that is refused when the config is loaded,
 naming it. The settings a config is meant to give a value to are the exception
 (`ROOT_CA_FILE`, `GITHUB_COM_CERT_SHA256`, `GITHUB_IO_CERT_SHA256`, `ARTIFACTS_DIR`, `RUNS_DIR`,
-`POD_OUTPUT_MAX_BYTES`).
+`POD_OUTPUT_MAX_BYTES`, `POD_TEXT_RANGES`).
 
 And because it is run as Python, a config that somebody else could have written is not loaded:
 the file and its directory have to be yours (or root's) and writable by nobody else, as ssh
@@ -169,6 +169,42 @@ it), a path may be listed once and not as both a file and a directory, and a pod
 In the list you are asked about, a path with a name that starts with a dot (`.envrc`,
 `.vscode/tasks.json`, `.github/workflows/…`) is shown in red: tools read those without being
 asked, and may run what is in them.
+
+`git diff` writes a file to the terminal as it is, and a terminal does not show a control
+character: it obeys it. A line can hide its own end (`ESC[8m`, black on black), write over itself
+(backspaces, a carriage return) or be shown in another order (a direction mark) — what is run is
+then not what was read. So a text that comes from a pod is checked before anything is written: it
+has to be UTF-8, with nothing in it but tabs, newlines (a carriage return right before one is
+fine) and the characters of `POD_TEXT_RANGES` — an allowlist, and a short one: ASCII, Latin-1 and
+Latin Extended-A letters, dashes and curly quotes, arrows, box drawing and symbols. No control
+character, nothing that cannot be seen (no-break space, zero-width and direction marks, variation
+selectors), no other alphabet (the Cyrillic U+0430 passes for a Latin `a`), no emoji. One such
+character anywhere in a file, changed by the pod or not, and nothing is fetched: the file, the line
+and the code point are said. What your projects do write in, the config adds:
+
+```python
+POD_TEXT_RANGES = (*POD_TEXT_RANGES, (0x1F300, 0x1FAFF), (0x0660, 0x0669))  # emoji, Arabic-Indic digits
+```
+
+All of this is said of a terminal that reads UTF-8, and mik expects yours to (`locale charmap`,
+and what the terminal itself is set to): git sends bytes, and it is the terminal that makes
+characters of them. One set to an 8-bit charset reads others in the same bytes — `Û` is in the
+ranges, it is `C3 9B` in UTF-8, and `9B` alone is a control there. Only ASCII says the same to
+every terminal: `POD_TEXT_RANGES = ((0x20, 0x7E),)` if yours is not UTF-8.
+
+A binary file is not looked into: `git diff` shows nothing of it, so there is nothing to hide in
+it. Binary is what git calls binary — a NUL in the first 8000 bytes; a NUL further down leaves the
+file a text, and it is refused. A file that is a text in the local repo and comes as a binary one
+is written like any other (an image that got its real content), and said in red once all is
+written: from then on `git diff` only says that it differs.
+
+That is git's plain rule, and an attribute changes it: with `working-tree-encoding=UTF-16LE` a
+file that is full of NULs on disk is converted and shown as a text, `diff` shows a binary file
+as one, a `filter` or a diff driver shows what a program made of it, `text` and `eol` leave a
+change of line ends out. Which attribute does what is not sorted out: a path git has any
+attribute for (asked of `git check-attr -a`, so from a `.gitattributes`, `.git/info/attributes`,
+your own attributes file or the system's) is refused before the question, and is to be copied by
+hand. A local repo with a `.gitattributes` is fetched into for the paths it says nothing of.
 
 ### Run records
 A script `deploy` (a list of shell lines) streams its output live while
